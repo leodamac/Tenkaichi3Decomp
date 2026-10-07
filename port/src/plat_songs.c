@@ -65,7 +65,7 @@ static void add_song(const char *file, const char *name) {
     i = gPortSongCount;
     snprintf(sFiles[i], sizeof(sFiles[i]), "%s", file);
     offset = PORT_SONG_FIRST_OFFSET + i;
-    index = PORT_SONG_BGM_FIRST + offset - 0xD48; /* the game's id -> partition 2 index */
+    index = PORT_SONG_FILE_INDEX + i; /* PORT_BGM_FILE(offset), as an index of the second archive */
     gPortSongOffsets[i] = offset;
     snprintf(gPortSongNames[i], 64, "%s", name);
     snprintf(sAliases[sAliasCount].rel, sizeof(sAliases[sAliasCount].rel), "pzs3us2/%05d.bin", index);
@@ -106,8 +106,8 @@ void PortSongs_Init(void) {
         fclose(fp);
     }
     {
-        static char found[32][128];
-        int n = PortExtras_Scan(sDir, ".adx", found, 32), k;
+        static char found[64][128];
+        int n = PortExtras_Scan(sDir, ".adx", found, 64), k;
         for (k = 0; k < n; k++) {
             char name[64];
             PortExtras_NameFromFile(found[k], name, sizeof(name));
@@ -143,4 +143,11 @@ int PortSongs_Alias(const char *rel, char *out, unsigned n) {
         }
     }
     return 0;
+}
+
+/* BT3_TEST_BGM=<entry>: every battle is set up with that entry of the music list, whatever the menus chose
+   (testing: 0x1A is the first added song). */
+int Port_TestBgm(void) {
+    const char *e = getenv("BT3_TEST_BGM");
+    return e != NULL && e[0] != '\0' ? (int)strtol(e, NULL, 0) : -1;
 }

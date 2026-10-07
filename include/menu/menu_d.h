@@ -134,6 +134,11 @@ typedef struct CharSelProgress {
 #define CHARSEL_STAGE_RANDOM 0x23        /* the "random" stage id; ids from here on are not real stages */
 #define CHARSEL_STAGE_COLS 6             /* columns of the stage grid (gProgress keeps col + row * 6) */
 #define CHARSEL_BGM_FIRST 0x10B16        /* Bgm_Play id of music list entry 0 */
+#ifdef PORT /* (a song added from outside the disc has a file id of its own: port/include/plat_songs.h) */
+#define CHARSEL_BGM_FILE(n) PORT_BGM_FILE(n)
+#else
+#define CHARSEL_BGM_FILE(n) (CHARSEL_BGM_FIRST + (n))
+#endif
 #define CHARSEL_BGM_RANDOM_FIRST 0x10B1E /* + Rand_Range(9) */
 
 typedef struct CharSel {

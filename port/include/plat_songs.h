@@ -9,7 +9,15 @@
    carries 0x14..0x17, which the menu drops. Added tracks take 0x1A onward, so they never touch a disc entry. */
 #define PORT_SONG_FIRST_OFFSET 0x1A
 #define PORT_SONG_BGM_FIRST 0x10B16 /* Bgm_Play id of music-list offset 0 */
-#define PORT_SONG_MAX 6             /* offsets 0x1A..0x1F: the save's music bits are one 32-bit word */
+#define PORT_SONG_MAX 40            /* the menu's list (64 places of ours) less the disc's songs and "random" */
+/* An added song's file. NOT 0x10B16 + its entry: those ids are disc files (0x10B30..0x10B33 are silent, 0x10B34
+   and 0x10B35 are the first two lines of the announcer), and the fifth and sixth added song stood in their place
+   (releases 0.1.8 to 0.1.11, found 2026-10-08). Past the end of the second archive (65,201 files) instead. The
+   limit was 6 for the save's 32 music bits, which an added song is never looked up in. */
+#define PORT_SONG_FILE_INDEX 73000
+#define PORT_BGM_FILE(n) \
+    ((n) >= PORT_SONG_FIRST_OFFSET && (n) < PORT_SONG_FIRST_OFFSET + PORT_SONG_MAX ? 0xD48 + PORT_SONG_FILE_INDEX + ((n) - PORT_SONG_FIRST_OFFSET) \
+                                                                                    : PORT_SONG_BGM_FIRST + (n))
 
 void PortSongs_Init(void);
 int PortSongs_Count(void);

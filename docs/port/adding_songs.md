@@ -157,7 +157,7 @@ That already works through the mods mechanism: just put the ADX at `gamedata/mod
 
 ## Limits and notes
 
-- **6 added songs** at most (offsets `0x1A..0x1F`; `bgmBits` is a u32).
+- **40 added songs** at most (see the end of this file; it was 6).
 - The audio is converted to **ADX** (ffmpeg `adpcm_adx`). The game plays it with its ADX decoder; other
   formats make no sound.
 - The music list is a **reel**: the added ones appear before Random.
@@ -177,3 +177,20 @@ At start-up the port logs how many songs it read:
 bt3: songs: 1 added track(s) from gamedata/songs/songs.txt
 bt3: song-name overlay: 1 names, 1024x64 each
 ```
+
+## The added songs' file numbers were disc files; 40 songs (2026-10-08)
+
+An added song was played as file 0x10B16 + its list entry, entries 0x1A..0x1F. Those are disc files: 0x10B30 to
+0x10B33 are silent files of 30,720 bytes, but 0x10B34 and 0x10B35 are the first two lines of the announcer
+(`HudNotice_GetVoiceBase`, the voice set used when `SAVE_FLAG_VOICE` is clear). With five or six songs added,
+those two lines were answered with the songs (releases 0.1.8 to 0.1.11).
+
+- Now an added song's file is 0xD48 + 73000 + n, past the end of the second archive (`PORT_BGM_FILE` in
+  port/include/plat_songs.h; used where the fight and the duel's music select play an entry).
+- The limit was 6 "because the save's music bits are one 32-bit word". An added song is never looked up there
+  (the unlocks are applied to the disc's list before the added ones are appended), and the entry is an s32
+  everywhere it is kept. The limit is 40: the list the menu is given has 72 places.
+- `BT3_TEST_BGM=<entry>`: every battle plays that entry (0x1A is the first added song).
+- Checked with 45 files in the folder: 40 are taken (the rest named in the log), the music select's list has 61
+  entries with "random" last, and a fight set to entries 0x1A, 0x1E, 0x1F and 0x41 opens the 1st, 5th, 6th and 40th
+  file; a disc entry opens none of them. Not checked: the forty names on screen, and scrolling the list by hand.

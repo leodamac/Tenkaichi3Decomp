@@ -626,15 +626,18 @@ void CharSel_Init(s32 section) {
         extern int Port_NetSession(void); /* port/src/gs/net.c */
         s32 added = Port_NetSession() ? 0 : gPortSongCount;
         if (added > 0) {
-            static s32 sBgmIds[64];
+            static s32 sBgmIds[72];
             s32 n = gCharSel->bgmCount, k, last = gCharSel->bgmIds[n - 1];
-            if (n > 62) {
-                n = 62;
+            if (n > 30) {
+                n = 30;
+            }
+            if (added > PORT_SONG_MAX) {
+                added = PORT_SONG_MAX;
             }
             for (k = 0; k < n - 1; k++) {
                 sBgmIds[k] = gCharSel->bgmIds[k];
             }
-            for (k = 0; k < added && (n - 1 + k) < 63; k++) {
+            for (k = 0; k < added; k++) {
                 sBgmIds[n - 1 + k] = gPortSongOffsets[k];
             }
             n = n - 1 + added + 1; /* the disc's songs + the added ones + the "random" entry */
@@ -737,7 +740,7 @@ void CharSel_Init(s32 section) {
     if (gCharSel->bgmIds[gCharSel->stage->bgmPlaying] == CHARSEL_BGM_RANDOM) {
         Bgm_Play(CHARSEL_BGM_RANDOM_FIRST + Rand_Range(9));
     } else {
-        Bgm_Play(CHARSEL_BGM_FIRST + gCharSel->bgmIds[gCharSel->stage->bgmPlaying]);
+        Bgm_Play(CHARSEL_BGM_FILE(gCharSel->bgmIds[gCharSel->stage->bgmPlaying]));
     }
     for (i = 0; i < CHARSEL_SIDES; i++) {
         TextBox_Init(&gCharSel->nameBox[i], gCharSel->nameText, i + 1);
@@ -1379,7 +1382,7 @@ void CharSel_Input(s32 *running) {
                     CharSel_ClipGoto(0, 0, CHARSEL_CLIP_STAGE_CHIP, "fl_on_start");
                     gCharSel->stage->bgmPlaying = gCharSel->stage->bgm;
                     if (gCharSel->bgmIds[gCharSel->stage->bgmPlaying] != CHARSEL_BGM_RANDOM) {
-                        Bgm_Play(CHARSEL_BGM_FIRST + gCharSel->bgmIds[gCharSel->stage->bgmPlaying]);
+                        Bgm_Play(CHARSEL_BGM_FILE(gCharSel->bgmIds[gCharSel->stage->bgmPlaying]));
                     }
                     gCharSel->stage->state = CHARSEL_ST_STAGE;
                     Snd_PlaySe(1, 1);

@@ -1525,6 +1525,14 @@ void BattleSetup_SetRule(s32 screenMode, s32 mode, s32 bgm, s32 timeLimit, s32 a
 #endif
     rule->screenMode = screenMode;
     rule->mode = mode;
+#ifdef PORT
+    {
+        extern int Port_TestBgm(void); /* port/src/plat_songs.c: BT3_TEST_BGM=<entry> (testing), else -1 */
+        if (Port_TestBgm() >= 0) {
+            bgm = Port_TestBgm();
+        }
+    }
+#endif
     if (bgm == 24) {
         rule->bgm = rand() % 24;
     } else {
