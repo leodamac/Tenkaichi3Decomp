@@ -5,6 +5,10 @@
 #include <string.h>
 #include "plat_stages.h"
 
+/* The added stages' models: files 70000.. of the second archive, past its end (65,201 files); the same number
+   as PORT_ADDED_STAGE_FILE in src/battle/battle_load.c. */
+#define PORT_STAGE_FILE_INDEX 70000
+
 char gPortStageNames[PORT_STAGE_MAX][64];
 int gPortExtraStageCount;
 int gPortExtraStages[PORT_STAGE_MAX];
@@ -97,12 +101,12 @@ static void add_stage(const char *file, const char *name) {
     snprintf(gPortStageNames[i], 64, "%s", name);
     gPortExtraStages[i] = id;
 
-    /* Its model: the game asks for a file id of the stage's own, 30000 + n past the start of the second archive
+    /* Its model: the game asks for a file id of the stage's own, 70000 + n past the start of the second archive
        (battle_load.c, PORT_ADDED_STAGE_FILE), where the disc has nothing. (It used to be 0x171 + stage, which is
        also the split-screen model of a disc stage from the fourth added stage on; and a second redirection, for
        a sound bank at 0x14E + stage, took the place of the disc stages' own models, the first added stage that
        of stage 1: with a stage added, a one-player fight on that disc stage was given the wrong file.) */
-    snprintf(sAliases[sAliasCount].rel, sizeof(sAliases[sAliasCount].rel), "pzs3us2/%05d.bin", 30000 + i);
+    snprintf(sAliases[sAliasCount].rel, sizeof(sAliases[sAliasCount].rel), "pzs3us2/%05d.bin", PORT_STAGE_FILE_INDEX + i);
     snprintf(sAliases[sAliasCount].target, sizeof(sAliases[sAliasCount].target), "%s/%s", sDir, file);
     sAliasCount++;
 
@@ -225,7 +229,7 @@ int Port_StageBufSize(void) {
    would overrun the buffer and corrupt the game's heap, which showed as a crash seconds later). */
 int Port_StageFits(const char *rel, long size) {
     int index = -1;
-    if (strncmp(rel, "pzs3us2/", 8) == 0 && sscanf(rel + 8, "%d", &index) == 1 && index >= 30000) {
+    if (strncmp(rel, "pzs3us2/", 8) == 0 && sscanf(rel + 8, "%d", &index) == 1 && index >= PORT_STAGE_FILE_INDEX) {
         return size <= Port_StageBufSize(); /* an added stage */
     }
     if (strncmp(rel, "pzs3us1/", 8) != 0 || sscanf(rel + 8, "%d", &index) != 1) {

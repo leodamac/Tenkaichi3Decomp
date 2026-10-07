@@ -15,7 +15,10 @@
    stages (0x198 on), and 0x14E + stage into the models (0x171 on). So an added stage's model has a file id of
    its own, far past the end of the second archive, which the port's file layer serves from the stages folder
    (port/src/plat_stages.c), and for its sound bank the first stage's is asked for. */
-#define PORT_ADDED_STAGE_FILE(stage) (0xD48 + 30000 + ((stage) - 0x24))
+/* (70000: past the end of the second archive, which has 65,201 files. It was 30000, taken for free; those are
+   the training mode's guide voice lines, and with n stages added the first n of them were replaced by stage
+   files. Found 2026-10-08 while listing the file ids for added characters.) */
+#define PORT_ADDED_STAGE_FILE(stage) (0xD48 + 70000 + ((stage) - 0x24))
 #define BTL_STAGE_MODEL(stage) ((stage) >= 0x24 ? PORT_ADDED_STAGE_FILE(stage) : (stage) + BTL_FILE_STAGE)
 #define BTL_STAGE_BANK(stage) (((stage) >= 0x24 ? 0 : (stage)) + BTL_FILE_SND_STAGE)
 #else
