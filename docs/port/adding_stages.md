@@ -233,3 +233,13 @@ the last whole row of 6 that fits; with all 36 disc stages unlocked that left 24
 26 = 62 stages are 11 rows, 66 cells with the last row's padding. Checked with 28 files in the folder: 26 are
 taken, the list has 62 entries ending in ids 0x3C and 0x3D (it had 60, ending in 0x3B), and a fight starts on
 0x3C and on 0x3D (`BT3_TEST_STAGE`). Not looked at on screen: the eleventh row.
+
+## The added stages' file numbers were disc files (2026-10-08)
+
+`PORT_ADDED_STAGE_FILE` was 0xD48 + 30000 + n, described above as a place where the disc has nothing. It has:
+the second archive holds 65,201 files, and 30000.. are the training mode's guide voice lines
+(`TRAIN_VOICE_BASE_B`, 0x8278). With n stages added, the first n of those lines were answered with a stage's
+file (releases 0.1.9 to 0.1.11). Found while listing the file ids for added characters. Now 70000 + n, past the
+archive's end (`PORT_STAGE_FILE_INDEX` in plat_stages.c, the same number in battle_load.c). Checked: fights start
+on the first and the last added stage and on a disc stage; the replay check on the Linux programs. Not checked:
+the training guide's lines heard.
