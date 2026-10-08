@@ -5,7 +5,6 @@
 
 #ifdef PORT
 extern int Port_NetSession(void); /* port/src/gs/net.c */
-static s32 sNetEnter; /* an online session has just come to this screen: go on to the battle type by itself */
 #endif
 
 DuelMenu *gDuelMenu = NULL; /* 0x3B38E8 */
@@ -284,12 +283,6 @@ void DuelMenu_Init(s32 section) {
     }
     DM->voiceLine = -1;
     DM->sel[DUEL_LEVEL_TOP] = DUEL_PROG->versus;
-#ifdef PORT
-    if (Port_NetSession()) {
-        DM->sel[DUEL_LEVEL_TOP] = 1;
-        sNetEnter = 1;
-    }
-#endif
     DM->sel[DUEL_LEVEL_TYPE] = DUEL_PROG->battleType;
     DM->sel[DUEL_LEVEL_DP] = DUEL_PROG->dpLimit;
 }
@@ -374,12 +367,6 @@ void DuelMenu_Draw(void) {
             Flash_FindLabel(flash, NULL, name, &ref);
             Flash_ClipSetColor(flash, &ref, (DM->flags & DUELMENU_NO_PAD2) ? 0.4f : 1.0f);
         }
-#ifdef PORT /* online session: the two rows with COM are greyed, as the game greys 1P vs 2P without a second pad */
-        if ((i == 0 || i == 2) && Port_NetSession()) {
-            Flash_FindLabel(flash, NULL, name, &ref);
-            Flash_ClipSetColor(flash, &ref, 0.4f);
-        }
-#endif
         DM_SET_UV(name, "mc_menu_text_off");
         DM_SET_UV(name, "mc_menu_text_on");
     }
@@ -598,11 +585,6 @@ void DuelMenu_Input(s32 *result) {
             if (DM_CUR < 0) {
                 DM_CUR = 3;
             }
-#ifdef PORT /* online session: 1P vs 2P and the battle settings only */
-            if (Port_NetSession() && DM_CUR != 3) {
-                DM_CUR = 1;
-            }
-#endif
             DM_LEVEL_GOTO("fl_on_start");
             DM_SAY(0, DM->sel[DUEL_LEVEL_TOP] + 1);
             Snd_PlaySe(1, 0);
@@ -618,23 +600,17 @@ void DuelMenu_Input(s32 *result) {
             if (DM_CUR >= 4) {
                 DM_CUR = 0;
             }
-#ifdef PORT
-            if (Port_NetSession() && DM_CUR != 1) {
-                DM_CUR = DM_CUR == 2 ? 3 : 1;
-            }
-#endif
             DM_LEVEL_GOTO("fl_on_start");
             DM_SAY(0, DM->sel[DUEL_LEVEL_TOP] + 1);
             Snd_PlaySe(1, 0);
-#ifdef PORT
-        /* PC build, online session: the screen opens on the battle type (single, team, DP battle), as if 1P vs 2P
-           had just been chosen; this list is what "back" leads to, and has two entries then (below). */
-        } else if ((gPad[0].gamePressed & PADG_CROSS) || sNetEnter) {
-            sNetEnter = 0;
-#else
         } else if (gPad[0].gamePressed & PADG_CROSS) {
-#endif
             DM->idle = 0;
+#ifdef PORT /* PC build: an online session is 1P vs 2P; the other two cannot be chosen in it */
+            if (Port_NetSession() && (DM_CUR == 0 || DM_CUR == 2)) {
+                Snd_PlaySe(1, 7);
+                break;
+            }
+#endif
             switch (DM_CUR) {
             case 3: {
                 char name[64];

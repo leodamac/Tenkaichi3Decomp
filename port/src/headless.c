@@ -115,10 +115,10 @@ int __wrap_Progress_Main(int arg) {
                    leads to the versus menu, where the host can change the battle type; back from there ends the
                    session. (After a battle the game itself returns to mode 39.) */
                 /* Since 0.1.15 the session opens on the versus menu itself (mode 38), with "1P vs 2P" under the
-                   cursor, and goes on by itself to the battle type: the host chooses single, team or DP battle (and
-                   the DP limit). Back from there is the list with 1P vs 2P and the battle settings (time and the
-                   rest); the two rows with COM are greyed and skipped (DuelMenu_Input). Both copies run the menu
-                   in step, so what is chosen is the same on both. */
+                   cursor: the host chooses single, team or DP battle (and the DP limit) there and can change the
+                   battle settings (time and the rest) before the first fight. Both copies run the menu in step, so
+                   what is chosen is the same on both. (1P vs COM and COM vs COM cannot be chosen in a session:
+                   DuelMenu_Input.) */
                 gProgress->mode = 38;
                 *(int *)((char *)gProgress + 0x620) = 1;
                 *(int *)((char *)gProgress + 0x624) = 0;
