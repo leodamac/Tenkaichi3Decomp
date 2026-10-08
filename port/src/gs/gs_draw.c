@@ -1397,7 +1397,7 @@ static int16_t sInterpPair[MAX_VU_UNIFORMS]; /* the previous picture's block eac
 
 static int interp_build(void) {
     uint32_t i, paired = 0, jumped = 0;
-    const float t = 0.5f;
+    const float t = getenv("BT3_INTERP_T") != NULL ? (float)atof(getenv("BT3_INTERP_T")) : 0.5f; /* (testing: 1 = picture n itself) */
 
     if (gsVuUniCount == 0 || sInterpPrevCount == 0) {
         return 0;
@@ -1524,8 +1524,9 @@ static int interp_build(void) {
  * changing text would slide from the old letters' places. */
 typedef struct InterpPrim {
     uint32_t sig, first; /* first: index of its first vertex */
-    uint8_t flat2d;
+    uint8_t flat2d, tris; /* tris: how many triangles the piece has (a quad: 2) */
 } InterpPrim;
+#define INTERP_PIECE_MAX 16 /* triangles of one piece (a longer strip is cut into several) */
 #define INTERP_MAX_PRIMS (MAX_VERTS / 3)
 #define INTERP_WINDOW 48      /* triangles before and after the same place in the run */
 #define INTERP_FAR 90.0f      /* GS pixels a vertex may move in a tick and still be blended */
@@ -1547,16 +1548,45 @@ static uint32_t interp_prims(InterpPrim *out) {
 
     for (n = 0; n < gsDrawCount; n++) {
         const GsDraw *d = &gsDraws[n];
-        if (d->vu != 0 || d->native != 0 || d->count % 3 != 0) {
+        uint32_t role;
+
+        /* Not the passes that draw one buffer into another (the glow's and the explosions' smaller copies, the
+           blur): their rectangles are in the coordinates of whichever buffer they fill, and a rectangle of one pass
+           blended with that of another is a square of garbage. They stay this picture's. */
+        if (d->vu != 0 || d->native != 0 || d->count % 3 != 0 || d->tex_is_target) {
             continue;
         }
-        for (k = 0; k + 3 <= d->count && count < INTERP_MAX_PRIMS; k += 3) {
-            /* (not the target: the game draws into its two frame buffers in turn, so it differs every picture; for
-               the same reason a frame buffer used as texture counts as one texture) */
-            out[count].sig = ((d->tex_is_target ? 0x7A7A7A7Au : (uint32_t)d->tex) * 2654435761u) ^ ((uint32_t)d->pipeline * 40503u) ^ ((uint32_t)d->tex_is_target << 26);
+        /* Which buffer it draws into, in a way that is the same next picture: the game shows its two frame buffers
+           in turn, so "the picture's own buffer" is one role; any other buffer is itself. */
+        role = d->target >= 0 && d->target < gsTargetCount && gGsMainFbp >= 0 && gsTargets[d->target].fbp == (uint32_t)gGsMainFbp
+                   ? 0u : 1u + (d->target >= 0 && d->target < gsTargetCount ? gsTargets[d->target].fbp : 0x3FFu);
+        /* The unit that is paired and moved is a PIECE: triangles that follow each other and share an edge (the two
+           halves of a sprite or of a puff of smoke, a strip). Paired one triangle at a time, the halves of a quad
+           found different partners and the quad came apart into wedges (seen in every explosion). */
+        for (k = 0; k + 3 <= d->count && count < INTERP_MAX_PRIMS;) {
+            uint32_t tris = 1;
+            while (k + (tris + 1) * 3 <= d->count && tris < INTERP_PIECE_MAX) {
+                const Vtx *a = &gsVerts[d->first + k + (tris - 1) * 3], *b = a + 3;
+                int shared = 0, x, y;
+                for (x = 0; x < 3; x++) {
+                    for (y = 0; y < 3; y++) {
+                        if (a[x].x == b[y].x && a[x].y == b[y].y) {
+                            shared++;
+                            break;
+                        }
+                    }
+                }
+                if (shared < 2) {
+                    break;
+                }
+                tris++;
+            }
+            out[count].sig = ((uint32_t)d->tex * 2654435761u) ^ ((uint32_t)d->pipeline * 40503u) ^ (role * 0x9E3779B1u) ^ (tris * 0x85EBCA6Bu);
             out[count].first = d->first + k;
             out[count].flat2d = d->misc[3] != 0.0f;
+            out[count].tris = (uint8_t)tris;
             count++;
+            k += tris * 3;
         }
     }
     qsort(out, count, sizeof(InterpPrim), interp_prim_cmp);
@@ -1586,7 +1616,7 @@ static void interp_build_verts(float t) {
             uint32_t n = end - i, m = pEnd - lo;
             uint32_t at = r < n / 2 || n > m + r ? (r < m ? r : m - 1) : m - (n - r);
             uint32_t from = at > INTERP_WINDOW ? at - INTERP_WINDOW : 0, to = at + INTERP_WINDOW + 1 < m ? at + INTERP_WINDOW + 1 : m, j;
-            int best = -1, k, sawFar = 0, sawUv = 0;
+            int best = -1, k, sawFar = 0, sawUv = 0, nv = c->tris * 3;
             float bestD = 0.0f;
 
             for (j = from; j < to; j++) {
@@ -1596,7 +1626,7 @@ static void interp_build_verts(float t) {
                     continue;
                 }
                 pv = &sInterpPrevVerts[sInterpPrevPrims[lo + j].first];
-                for (k = 0; k < 3; k++) {
+                for (k = 0; k < nv; k++) {
                     float dx = fabsf(pv[k].x - cv[k].x), dy = fabsf(pv[k].y - cv[k].y);
                     d += dx + dy;
                     if (dx > far) { far = dx; }
@@ -1624,15 +1654,12 @@ static void interp_build_verts(float t) {
                 Vtx *ov = &sInterpBlendVerts[c->first];
                 sInterpPrimUsed[lo + best] = 1;
                 if (bestD != 0.0f) {
-                    for (k = 0; k < 3; k++) {
+                    for (k = 0; k < nv; k++) {
                         ov[k].x = pv[k].x + (cv[k].x - pv[k].x) * t;
                         ov[k].y = pv[k].y + (cv[k].y - pv[k].y) * t;
                         ov[k].z = pv[k].z + (cv[k].z - pv[k].z) * t;
-                        if (!c->flat2d) {
-                            ov[k].s = pv[k].s + (cv[k].s - pv[k].s) * t;
-                            ov[k].t = pv[k].t + (cv[k].t - pv[k].t) * t;
-                            ov[k].q = pv[k].q + (cv[k].q - pv[k].q) * t;
-                        }
+                        /* (the texture coordinates stay this picture's: a puff of an explosion shows another cell of
+                           its animated texture every picture, and half way between two cells is a square of both) */
                     }
                     gInterpTrisBlended++;
                 } else {
@@ -1726,7 +1753,7 @@ void GsGpu_FrameEnd(void) {
             Vtx *realVerts = gsVerts;
 
             if (getenv("BT3_INTERP_3D") == NULL) { /* (BT3_INTERP_3D=1: the vertex programs' draws only, as the first prototype) */
-                interp_build_verts(0.5f);
+                interp_build_verts(getenv("BT3_INTERP_T") != NULL ? (float)atof(getenv("BT3_INTERP_T")) : 0.5f);
             }
 
             sInterpSaved.verts = gsVertCount;
