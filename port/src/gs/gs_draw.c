@@ -1284,6 +1284,10 @@ int GsGpu_Init(void) {
  * would jump far on screen (a camera cut, a teleport) is not blended, and when most are like that no in-between
  * picture is shown at all. */
 int gsInterp = -1;
+/* The camera's change of this picture (interp_build): previous clip position = sInterpD * this clip position, for
+   anything that stands still in the world; and the numbers that turn GS pixels into that clip space. */
+static float sInterpD[16], sInterpOffX, sInterpOffY, sInterpZMax;
+static int sInterpHaveD;
 static Vu0Uniform *sInterpPrev, *sInterpBlend;
 static uint32_t *sInterpPrevSig, *sInterpSig;
 static uint32_t sInterpPrevCount;
@@ -1420,7 +1424,7 @@ static int interp_build(void) {
         const Vu0Uniform *c = &gsVuUni[i];
         Vu0Uniform *o = &sInterpBlend[i];
         const float *cf = (const float *)c;
-        float xa, ya, xb, yb, bestDist = 0.0f;
+        float xa, ya, xb, yb, bestDist = 0.0f, bestDist2 = 0.0f;
         int sa, sb, k, best = -1;
         uint16_t j;
 
@@ -1433,14 +1437,22 @@ static int interp_build(void) {
             /* (a shadow's strips are several blocks with one fighter's matrices, and their number changes with
                the ground: each takes the nearest of the previous picture, used before or not) */
             if (sInterpPrevSig[j] == sInterpSig[i] && (!sInterpUsed[j] || sInterpSig[i] == 0x53484457u)) {
+                /* Nearest first by where the mesh stands (bones and pivots), and only among equals by the screen
+                   matrix. One sum over both let the camera decide: the sky is the same slice of a dome many times
+                   over, and while the camera turned, the slice NEXT to a slice had the nearer screen matrix. A slice
+                   blended towards its neighbour leaves a streak (seen in 16:9, where more slices are on screen). */
                 const float *pf = (const float *)&sInterpPrev[j];
-                float dist = 0.0f;
-                for (k = 0; k < 56; k++) { /* bones, pivots, screen matrix */
+                float dist = 0.0f, dist2 = 0.0f;
+                for (k = 0; k < 40; k++) { /* bones, pivots */
                     dist += fabsf(pf[k] - cf[k]);
                 }
-                if (best < 0 || dist < bestDist) {
+                for (k = 40; k < 56; k++) { /* screen matrix */
+                    dist2 += fabsf(pf[k] - cf[k]);
+                }
+                if (best < 0 || dist < bestDist || (dist == bestDist && dist2 < bestDist2)) {
                     best = j;
                     bestDist = dist;
+                    bestDist2 = dist2;
                 }
             }
         }
@@ -1499,11 +1511,16 @@ static int interp_build(void) {
                 }
                 if (err <= mag * 0.002f) {
                     agreed = 1;
+                    memcpy(sInterpD, D, sizeof(D));
+                    sInterpOffX = c->misc[0];
+                    sInterpOffY = c->misc[1];
+                    sInterpZMax = c->misc[2];
                 } else {
                     break; /* the two do not share a camera move: no guess */
                 }
             }
         }
+        sInterpHaveD = agreed && sInterpZMax > 0.0f;
         if (agreed) {
             for (i = 0; i < gsVuUniCount; i++) {
                 if (sInterpPair[i] < 0 && sInterpSig[i] != 0) {
@@ -1517,6 +1534,14 @@ static int interp_build(void) {
                     gInterpCamera++;
                 }
             }
+        }
+    }
+    if (getenv("BT3_INTERP_FRAMES") != NULL) { /* testing: one line per picture */
+        static FILE *fp;
+        extern unsigned gPortVBlanks;
+        if (fp == NULL) { fp = fopen(getenv("BT3_INTERP_FRAMES"), "w"); }
+        if (fp != NULL) {
+            fprintf(fp, "%u %u blocks %u paired %u jumped %u previous %u\n", gPortVBlanks, gGsFrame, gsVuUniCount, paired, jumped, sInterpPrevCount);
         }
     }
     gInterpPaired += paired;
@@ -1544,7 +1569,65 @@ static Vtx *sInterpPrevVerts, *sInterpBlendVerts;
 static InterpPrim *sInterpPrevPrims, *sInterpPrims;
 static uint32_t sInterpPrevPrimCount, sInterpPrimCount, sInterpPrevVertCount;
 static uint8_t *sInterpPrimUsed;
-static unsigned gInterpTris, gInterpTrisBlended;
+static unsigned gInterpTris, gInterpTrisBlended, gInterpTrisCamera;
+
+/* Where a vertex the game transformed itself was one picture earlier if the thing it belongs to stood still: back to
+   clip space (its q is 1 / w), through the camera's change, and to pixels again. 0 = it cannot be said. */
+static int interp_reproject(const Vtx *v, float *x, float *y, float *z) {
+    float w, c[4], p[4];
+    int i;
+
+    if (!(v->q > 1e-20f) || !(v->q < 1e20f)) {
+        return 0;
+    }
+    w = 1.0f / v->q;
+    c[0] = (v->x + sInterpOffX) * w;
+    c[1] = (v->y + sInterpOffY) * w;
+    c[2] = v->z * sInterpZMax * w;
+    c[3] = w;
+    for (i = 0; i < 4; i++) {
+        p[i] = sInterpD[i] * c[0] + sInterpD[4 + i] * c[1] + sInterpD[8 + i] * c[2] + sInterpD[12 + i] * c[3];
+    }
+    if (!(p[3] > w * 0.05f)) { /* behind the eye then, or nearly */
+        return 0;
+    }
+    *x = p[0] / p[3] - sInterpOffX;
+    *y = p[1] / p[3] - sInterpOffY;
+    *z = p[2] / p[3] / sInterpZMax;
+    return 1;
+}
+
+/* Moves a piece by the camera's change. 0 = not possible (it keeps this picture's place). */
+static int interp_piece_camera(const InterpPrim *c, float t) {
+    const Vtx *cv = &gsVerts[c->first];
+    Vtx *ov = &sInterpBlendVerts[c->first];
+    float x[INTERP_PIECE_MAX * 3], y[INTERP_PIECE_MAX * 3], z[INTERP_PIECE_MAX * 3];
+    int k, nv = c->tris * 3;
+
+    {   /* Not what faces the screen flat (every corner at the same depth: a banner, a flash, a sprite of the HUD
+           drawn with perspective numbers): that is laid onto the screen, not standing in the world. (The "Fight!"
+           banner slid down with the camera.) */
+        float q0 = cv[0].q, q1 = q0;
+        for (k = 1; k < nv; k++) {
+            if (cv[k].q < q0) { q0 = cv[k].q; }
+            if (cv[k].q > q1) { q1 = cv[k].q; }
+        }
+        if (!(q1 - q0 > q1 * 1e-4f)) {
+            return 0;
+        }
+    }
+    for (k = 0; k < nv; k++) {
+        if (!interp_reproject(&cv[k], &x[k], &y[k], &z[k]) || fabsf(x[k] - cv[k].x) > 400.0f || fabsf(y[k] - cv[k].y) > 400.0f) {
+            return 0;
+        }
+    }
+    for (k = 0; k < nv; k++) {
+        ov[k].x = x[k] + (cv[k].x - x[k]) * t;
+        ov[k].y = y[k] + (cv[k].y - y[k]) * t;
+        ov[k].z = z[k] + (cv[k].z - z[k]) * t;
+    }
+    return 1;
+}
 static unsigned gInterpWhy[5]; /* no like-drawn triangle before; all too far; 2D with another piece of texture; standing still; (spare) */
 
 static int interp_prim_cmp(const void *a, const void *b) {
@@ -1618,6 +1701,11 @@ static void interp_build_verts(float t) {
         gInterpTris += end - i;
         if (pEnd == lo) {
             gInterpWhy[0] += end - i;
+            for (r = 0; sInterpHaveD && r < end - i; r++) {
+                if (!sInterpPrims[i + r].flat2d && interp_piece_camera(&sInterpPrims[i + r], t)) {
+                    gInterpTrisCamera++;
+                }
+            }
         }
         for (r = 0; pEnd > lo && r < end - i; r++) {
             const InterpPrim *c = &sInterpPrims[i + r];
@@ -1628,6 +1716,24 @@ static void interp_build_verts(float t) {
             uint32_t from = at > INTERP_WINDOW ? at - INTERP_WINDOW : 0, to = at + INTERP_WINDOW + 1 < m ? at + INTERP_WINDOW + 1 : m, j;
             int best = -1, k, sawFar = 0, sawUv = 0, nv = c->tris * 3;
             float bestD = 0.0f;
+
+            /* Big pieces and pieces cut off at the edge of the screen are scenery the game transforms itself (the
+               sky's panels): cut differently every picture, so "the nearest like piece" is another panel or another
+               cut of it, and panels blended towards different partners leave streaks between them. They stand still
+               in the world: the camera's change says exactly where each of their corners was. */
+            if (!c->flat2d && sInterpHaveD) {
+                float x0 = cv[0].x, x1 = x0, y0 = cv[0].y, y1 = y0;
+                for (k = 1; k < nv; k++) {
+                    if (cv[k].x < x0) { x0 = cv[k].x; } if (cv[k].x > x1) { x1 = cv[k].x; }
+                    if (cv[k].y < y0) { y0 = cv[k].y; } if (cv[k].y > y1) { y1 = cv[k].y; }
+                }
+                if (x0 < -8.0f || y0 < -8.0f || x1 > 520.0f || y1 > 456.0f || (x1 - x0) * (y1 - y0) > 6000.0f) {
+                    if (interp_piece_camera(c, t)) {
+                        gInterpTrisCamera++;
+                        continue;
+                    }
+                }
+            }
 
             for (j = from; j < to; j++) {
                 const Vtx *pv;
@@ -1666,6 +1772,17 @@ static void interp_build_verts(float t) {
                 const Vtx *pv = &sInterpPrevVerts[sInterpPrevPrims[lo + best].first];
                 Vtx *ov = &sInterpBlendVerts[c->first];
                 sInterpPrimUsed[lo + best] = 1;
+                if (bestD != 0.0f && getenv("BT3_INTERP_DUMP") != NULL && (int)gGsFrame == atoi(getenv("BT3_INTERP_DUMP"))) {
+                    float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, px0 = 1e9f, px1 = -1e9f, py0 = 1e9f, py1 = -1e9f;
+                    for (k = 0; k < nv; k++) {
+                        if (cv[k].x < x0) { x0 = cv[k].x; } if (cv[k].x > x1) { x1 = cv[k].x; }
+                        if (cv[k].y < y0) { y0 = cv[k].y; } if (cv[k].y > y1) { y1 = cv[k].y; }
+                        if (pv[k].x < px0) { px0 = pv[k].x; } if (pv[k].x > px1) { px1 = pv[k].x; }
+                        if (pv[k].y < py0) { py0 = pv[k].y; } if (pv[k].y > py1) { py1 = pv[k].y; }
+                    }
+                    fprintf(stderr, "piece sig %08x tris %d flat %d rank %u/%u<-%u/%u now %.0f,%.0f..%.0f,%.0f before %.0f,%.0f..%.0f,%.0f d %.0f\n", c->sig, c->tris, c->flat2d,
+                            r, end - i, (unsigned)best, pEnd - lo, x0, y0, x1, y1, px0, py0, px1, py1, bestD);
+                }
                 if (bestD != 0.0f) {
                     for (k = 0; k < nv; k++) {
                         ov[k].x = pv[k].x + (cv[k].x - pv[k].x) * t;
@@ -1680,6 +1797,10 @@ static void interp_build_verts(float t) {
                 }
             } else {
                 gInterpWhy[sawUv ? 2 : sawFar ? 1 : 4]++;
+                /* no partner (new, or too fast): at least the camera's change is known */
+                if (!c->flat2d && sInterpHaveD && interp_piece_camera(c, t)) {
+                    gInterpTrisCamera++;
+                }
             }
         }
         i = end;
@@ -1829,6 +1950,8 @@ void GsGpu_FrameEnd(void) {
                 fprintf(stderr, "interp:   of those without a partner, %u moved with the camera\n", gInterpCamera);
                 fprintf(stderr, "interp:   effects and 2D: %u triangles, %u moved, %u still; not paired: %u new kind, %u too far, %u other texture piece, %u none free\n",
                         gInterpTris, gInterpTrisBlended, gInterpWhy[3], gInterpWhy[0], gInterpWhy[1], gInterpWhy[2], gInterpWhy[4]);
+                fprintf(stderr, "interp:   pieces moved by the camera's change: %u\n", gInterpTrisCamera);
+                gInterpTrisCamera = 0;
                 memset(gInterpWhy, 0, sizeof(gInterpWhy));
                 gInterpPaired = gInterpUnpaired = gInterpCamera = gInterpTris = gInterpTrisBlended = 0;
             }
