@@ -3039,6 +3039,9 @@ void BtlAct_ClashStruggleHandler(ActGChr *chr, s32 phase) {
         BtlChar_SetFlag(chr, 0x134);
         if (chr->actionFrame >= 0x10 && BtlInput_TestAction(chr, 0x33, 1)) {
             chr->clashPower++;
+#ifdef PORT /* PC build: BT3_CLASH_LOG=1 says what a clash counts (testing the Square option) */
+            Port_ClashLog(chr->player, "beam clash", 1, chr->clashPower, chr->actionFrame);
+#endif
         }
     }
     if (phase == 2) {
@@ -3055,6 +3058,9 @@ void BtlAct_ClashStruggleHandler(ActGChr *chr, s32 phase) {
     if (phase == 3) {
         BtlSuper_Leave(chr, slot);
         BtlChar_ClearFlagRange(chr, 0xBF, 0xC3);
+#ifdef PORT
+        Port_ClashLog(chr->player, "beam clash", 0, chr->clashPower, chr->actionFrame);
+#endif
         chr->clashPower = 0;
     }
 }

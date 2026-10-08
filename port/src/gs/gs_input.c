@@ -283,6 +283,25 @@ static void clash_square(int socket, unsigned *btn, unsigned char *lx, unsigned 
     }
 }
 
+/* BT3_CLASH_LOG=1: one line for every point a clash counts from a newly pressed direction (the stick, the d-pad, or
+   Square with the option above), and the total as a beam clash ends. Called from the game's clash handlers. */
+void Port_ClashLog(int player, const char *what, int fromInput, int total, int frame) {
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("BT3_CLASH_LOG") != NULL;
+    }
+    if (!on) {
+        return;
+    }
+    if (fromInput) {
+        fprintf(stderr, "clash: player %d, %s, frame %d: +1 from input, total %d%s\n", player + 1, what, frame, total,
+                Port_ClashSquare() ? " (Square option on)" : "");
+    } else {
+        fprintf(stderr, "clash: player %d, %s ended after %d frames with %d points\n", player + 1, what, frame, total);
+    }
+}
+
 int Port_PadRead(int socket, unsigned char *data) {
     unsigned btn = 0;
     unsigned char rx = 0x80, ry = 0x80, lx = 0x80, ly = 0x80;
