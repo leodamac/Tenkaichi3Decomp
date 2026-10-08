@@ -1515,7 +1515,147 @@ static int interp_build(void) {
     return paired != 0 && jumped * 2 <= paired;
 }
 
+/* ---- the primitives the game transformed itself (effects, beams, dust, the HUD): Vtx in GS pixels ----
+ * They have no matrix to blend, so their vertices are: each triangle of this picture is paired with a triangle of
+ * the previous picture that is drawn the same way (texture, pipeline, target) and lies nearest, looked for around
+ * the same place in the run of such triangles (particles keep their order while others are born and die). A
+ * triangle whose nearest partner is far away keeps this picture's position (a beam's tip, a new spark, a cut).
+ * 2D art (sprites with whole-texel coordinates: HUD, text) must also show the same piece of its texture, or a
+ * changing text would slide from the old letters' places. */
+typedef struct InterpPrim {
+    uint32_t sig, first; /* first: index of its first vertex */
+    uint8_t flat2d;
+} InterpPrim;
+#define INTERP_MAX_PRIMS (MAX_VERTS / 3)
+#define INTERP_WINDOW 48      /* triangles before and after the same place in the run */
+#define INTERP_FAR 90.0f      /* GS pixels a vertex may move in a tick and still be blended */
+static Vtx *sInterpPrevVerts, *sInterpBlendVerts;
+static InterpPrim *sInterpPrevPrims, *sInterpPrims;
+static uint32_t sInterpPrevPrimCount, sInterpPrimCount, sInterpPrevVertCount;
+static uint8_t *sInterpPrimUsed;
+static unsigned gInterpTris, gInterpTrisBlended;
+static unsigned gInterpWhy[5]; /* no like-drawn triangle before; all too far; 2D with another piece of texture; standing still; (spare) */
+
+static int interp_prim_cmp(const void *a, const void *b) {
+    const InterpPrim *x = a, *y = b;
+    return x->sig != y->sig ? (x->sig < y->sig ? -1 : 1) : x->first < y->first ? -1 : x->first > y->first;
+}
+
+/* The triangles of the recorded frame's own-transformed draws, sorted by how they are drawn and then by order. */
+static uint32_t interp_prims(InterpPrim *out) {
+    uint32_t n, k, count = 0;
+
+    for (n = 0; n < gsDrawCount; n++) {
+        const GsDraw *d = &gsDraws[n];
+        if (d->vu != 0 || d->native != 0 || d->count % 3 != 0) {
+            continue;
+        }
+        for (k = 0; k + 3 <= d->count && count < INTERP_MAX_PRIMS; k += 3) {
+            /* (not the target: the game draws into its two frame buffers in turn, so it differs every picture; for
+               the same reason a frame buffer used as texture counts as one texture) */
+            out[count].sig = ((d->tex_is_target ? 0x7A7A7A7Au : (uint32_t)d->tex) * 2654435761u) ^ ((uint32_t)d->pipeline * 40503u) ^ ((uint32_t)d->tex_is_target << 26);
+            out[count].first = d->first + k;
+            out[count].flat2d = d->misc[3] != 0.0f;
+            count++;
+        }
+    }
+    qsort(out, count, sizeof(InterpPrim), interp_prim_cmp);
+    return count;
+}
+
+static void interp_build_verts(float t) {
+    uint32_t i, lo = 0;
+
+    memcpy(sInterpBlendVerts, gsVerts, gsVertCount * sizeof(Vtx));
+    memset(sInterpPrimUsed, 0, sInterpPrevPrimCount);
+    for (i = 0; i < sInterpPrimCount;) {
+        uint32_t sig = sInterpPrims[i].sig, end = i, pEnd, r;
+
+        while (end < sInterpPrimCount && sInterpPrims[end].sig == sig) { end++; }
+        while (lo < sInterpPrevPrimCount && sInterpPrevPrims[lo].sig < sig) { lo++; }
+        pEnd = lo;
+        while (pEnd < sInterpPrevPrimCount && sInterpPrevPrims[pEnd].sig == sig) { pEnd++; }
+        gInterpTris += end - i;
+        if (pEnd == lo) {
+            gInterpWhy[0] += end - i;
+        }
+        for (r = 0; pEnd > lo && r < end - i; r++) {
+            const InterpPrim *c = &sInterpPrims[i + r];
+            const Vtx *cv = &gsVerts[c->first];
+            /* the same place in the previous run, counted from the nearer end (births and deaths happen at one) */
+            uint32_t n = end - i, m = pEnd - lo;
+            uint32_t at = r < n / 2 || n > m + r ? (r < m ? r : m - 1) : m - (n - r);
+            uint32_t from = at > INTERP_WINDOW ? at - INTERP_WINDOW : 0, to = at + INTERP_WINDOW + 1 < m ? at + INTERP_WINDOW + 1 : m, j;
+            int best = -1, k, sawFar = 0, sawUv = 0;
+            float bestD = 0.0f;
+
+            for (j = from; j < to; j++) {
+                const Vtx *pv;
+                float d = 0.0f, far = 0.0f;
+                if (sInterpPrimUsed[lo + j]) {
+                    continue;
+                }
+                pv = &sInterpPrevVerts[sInterpPrevPrims[lo + j].first];
+                for (k = 0; k < 3; k++) {
+                    float dx = fabsf(pv[k].x - cv[k].x), dy = fabsf(pv[k].y - cv[k].y);
+                    d += dx + dy;
+                    if (dx > far) { far = dx; }
+                    if (dy > far) { far = dy; }
+                }
+                if (far > INTERP_FAR) {
+                    sawFar = 1;
+                    continue;
+                }
+                if (c->flat2d && (fabsf(pv[0].s - cv[0].s) > 0.01f || fabsf(pv[0].t - cv[0].t) > 0.01f || fabsf(pv[2].s - cv[2].s) > 0.01f ||
+                                  fabsf(pv[2].t - cv[2].t) > 0.01f)) {
+                    sawUv = 1;
+                    continue;
+                }
+                if (best < 0 || d < bestD) {
+                    best = (int)j;
+                    bestD = d;
+                    if (d == 0.0f) {
+                        break;
+                    }
+                }
+            }
+            if (best >= 0) {
+                const Vtx *pv = &sInterpPrevVerts[sInterpPrevPrims[lo + best].first];
+                Vtx *ov = &sInterpBlendVerts[c->first];
+                sInterpPrimUsed[lo + best] = 1;
+                if (bestD != 0.0f) {
+                    for (k = 0; k < 3; k++) {
+                        ov[k].x = pv[k].x + (cv[k].x - pv[k].x) * t;
+                        ov[k].y = pv[k].y + (cv[k].y - pv[k].y) * t;
+                        ov[k].z = pv[k].z + (cv[k].z - pv[k].z) * t;
+                        if (!c->flat2d) {
+                            ov[k].s = pv[k].s + (cv[k].s - pv[k].s) * t;
+                            ov[k].t = pv[k].t + (cv[k].t - pv[k].t) * t;
+                            ov[k].q = pv[k].q + (cv[k].q - pv[k].q) * t;
+                        }
+                    }
+                    gInterpTrisBlended++;
+                } else {
+                    gInterpWhy[3]++;
+                }
+            } else {
+                gInterpWhy[sawUv ? 2 : sawFar ? 1 : 4]++;
+            }
+        }
+        i = end;
+        lo = pEnd;
+    }
+}
+
 static void interp_remember(void) {
+    {
+        InterpPrim *swap = sInterpPrevPrims;
+        sInterpPrevPrims = sInterpPrims;
+        sInterpPrims = swap;
+        sInterpPrevPrimCount = sInterpPrimCount;
+        memcpy(sInterpPrevVerts, gsVerts, gsVertCount * sizeof(Vtx));
+        sInterpPrevVertCount = gsVertCount;
+    }
     memcpy(sInterpPrev, gsVuUni, gsVuUniCount * sizeof(Vu0Uniform));
     memcpy(sInterpPrevSig, sInterpSig, gsVuUniCount * sizeof(uint32_t));
     sInterpPrevCount = gsVuUniCount;
@@ -1571,12 +1711,23 @@ void GsGpu_FrameEnd(void) {
             sInterpBlend = malloc(MAX_VU_UNIFORMS * sizeof(Vu0Uniform));
             sInterpPrevSig = malloc(MAX_VU_UNIFORMS * sizeof(uint32_t));
             sInterpSig = malloc(MAX_VU_UNIFORMS * sizeof(uint32_t));
+            sInterpPrevVerts = malloc(MAX_VERTS * sizeof(Vtx));
+            sInterpBlendVerts = malloc(MAX_VERTS * sizeof(Vtx));
+            sInterpPrevPrims = malloc(INTERP_MAX_PRIMS * sizeof(InterpPrim));
+            sInterpPrims = malloc(INTERP_MAX_PRIMS * sizeof(InterpPrim));
+            sInterpPrimUsed = malloc(INTERP_MAX_PRIMS);
         }
         if (gsInterp > 0) {
             interp_signatures(sInterpSig);
+            sInterpPrimCount = interp_prims(sInterpPrims);
         }
         if (gsInterp > 0 && interp_build()) {
             Vu0Uniform *real = gsVuUni;
+            Vtx *realVerts = gsVerts;
+
+            if (getenv("BT3_INTERP_3D") == NULL) { /* (BT3_INTERP_3D=1: the vertex programs' draws only, as the first prototype) */
+                interp_build_verts(0.5f);
+            }
 
             sInterpSaved.verts = gsVertCount;
             sInterpSaved.vuVerts = gsVuVertCount;
@@ -1591,14 +1742,21 @@ void GsGpu_FrameEnd(void) {
             }
             interp_remember();
             gsVuUni = sInterpBlend;
+            if (getenv("BT3_INTERP_3D") == NULL) {
+                gsVerts = sInterpBlendVerts; /* (after interp_remember: that keeps the real vertices) */
+            }
             sBackend->frameEnd(); /* the in-between picture; the real one follows at the next vertical blank */
             gsVuUni = real;
+            gsVerts = realVerts;
             sInterpPending = 1;
             gInterpShown++;
             if (getenv("BT3_INTERP_LOG") != NULL && (gInterpShown + gInterpSkipped) % 300 == 0) {
                 fprintf(stderr, "interp: %u in-between pictures shown, %u left out; blocks: %u blended, %u not\n", gInterpShown, gInterpSkipped, gInterpPaired, gInterpUnpaired);
                 fprintf(stderr, "interp:   of those without a partner, %u moved with the camera\n", gInterpCamera);
-                gInterpPaired = gInterpUnpaired = gInterpCamera = 0;
+                fprintf(stderr, "interp:   effects and 2D: %u triangles, %u moved, %u still; not paired: %u new kind, %u too far, %u other texture piece, %u none free\n",
+                        gInterpTris, gInterpTrisBlended, gInterpWhy[3], gInterpWhy[0], gInterpWhy[1], gInterpWhy[2], gInterpWhy[4]);
+                memset(gInterpWhy, 0, sizeof(gInterpWhy));
+                gInterpPaired = gInterpUnpaired = gInterpCamera = gInterpTris = gInterpTrisBlended = 0;
             }
         } else {
             if (gsInterp > 0) {
