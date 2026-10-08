@@ -19,6 +19,7 @@ static int sGL; // 1: the OpenGL back end draws the window (ImGui's OpenGL3 back
 extern "C" {
 extern volatile int gPortNetMenuRequest;
 void Port_NetOptions(int rollback, int delay); // gs/net.c
+void Port_NetRulesSet(int type, int dp, int time); // gs/net.c: the host's battle type, DP limit row, time limit
 int Port_NetStats(int *out);                   // gs/net.c: the meter's numbers of an online match
 int Port_LobbyOther(void);
 extern unsigned gPortLiveBlanks;               // plat_stub.c: vertical blanks the game has gone through
@@ -290,7 +291,7 @@ static void net_open(void) {
 
 static void build_net(void) {
     static char name[17] = "Player", address[64] = "", port[8] = "7000";
-    static int tab, roll = -1, delay = 1;
+    static int tab, roll = -1, delay = 1, battle = -1, timeLimit = 3;
     ImGuiIO &io = ImGui::GetIO();
     bool open = true;
 
@@ -334,6 +335,22 @@ static void build_net(void) {
                                       "has to guess too far ahead and stutters. Automatic measures the connection when the match\n"
                                       "starts: 1 frame on a good one, more on a slow one.");
                 }
+                {
+                    // The match's rules: the game's own versus menu is not shown online, so they are chosen here.
+                    static const char *const kBattle[] = {"Single battle", "Team battle", "DP battle (10 DP)", "DP battle (15 DP)", "DP battle (20 DP)"};
+                    static const char *const kTime[] = {"60 seconds", "90 seconds", "180 seconds", "240 seconds", "No limit"};
+                    if (battle < 0) {
+                        battle = Port_Setting("net_battle", 0);
+                        timeLimit = Port_Setting("net_time", 3);
+                        if (battle < 0 || battle > 4) { battle = 0; }
+                        if (timeLimit < 0 || timeLimit > 4) { timeLimit = 3; }
+                    }
+                    ImGui::Spacing();
+                    ImGui::SetNextItemWidth(260.0f);
+                    ImGui::Combo("Battle", &battle, kBattle, 5);
+                    ImGui::SetNextItemWidth(260.0f);
+                    ImGui::Combo("Time limit", &timeLimit, kTime, 5);
+                }
                 ImGui::TextDisabled("The host's choices apply to both players.");
                 ImGui::EndTabItem();
             }
@@ -373,6 +390,11 @@ static void build_net(void) {
                 if (ImGui::Button(tab == 0 ? "Host a match" : "Join the match", ImVec2(200.0f, 0.0f))) {
                     if (tab == 0 && roll >= 0) {
                         Port_NetOptions(roll * 2, delay == 0 ? -2 : delay - 1);
+                        if (battle >= 0) {
+                            Port_NetRulesSet(battle == 0 ? 0 : battle == 1 ? 1 : 2, battle >= 2 ? battle - 2 : 0, timeLimit);
+                            Port_SettingSave("net_battle", battle);
+                            Port_SettingSave("net_time", timeLimit);
+                        }
                         Port_SettingSave("net_rollback2", roll * 2);
                         Port_SettingSave("net_delay2", delay - 1);
                         Port_SettingsWrite();

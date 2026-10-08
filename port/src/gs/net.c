@@ -49,7 +49,7 @@ enum { T_HELLO = 1, T_HELLO_ACK = 2, T_INPUT = 3, T_BYE = 4, T_PING = 5, T_PONG 
 /* The version of what goes over the line. The greeting and its answer carry it, and two copies that differ do not
    start a match (the input packets changed with version 2: times for the ping were added; a copy that read them
    the old way took them for input). 1 was releases 0.1.8 and 0.1.9, which said no version. */
-enum { NET_VERSION = 2, IN_HEAD = 32 };
+enum { NET_VERSION = 3, IN_HEAD = 32 }; /* 3 (0.1.15): the host's battle rules travel with its choices */
 static int sVersionBad; /* the other side answered with another version */
 static const uint32_t kVersion = NET_VERSION;
 static int sLobbyOther;
@@ -83,6 +83,23 @@ void Port_NetOptions(int rollback, int delay) {
     sOptRoll = rollback;
     sOptAuto = delay == -2; /* -2: automatic; -1: not said; else the delay in blanks */
     sOptDelay = delay >= 0 ? delay : -1;
+}
+
+/* The match's rules, chosen by the host in the lobby window (the game's own versus menu is not shown in a session):
+   the battle type as the versus menu leaves it (0 single, 1 team, 2 DP battle), the row of the DP limit list
+   (0..2: 10, 15, 20) and the time limit as the battle settings keep it (save rule 0: 0..4 = 60, 90, 180, 240
+   seconds, none). One word: type | dp << 4 | time << 8. The host's travels with its other choices (T_HELLO_ACK,
+   T_CONFIG); headless.c applies it on both sides when the session enters the versus mode. */
+static uint32_t sRules = 3u << 8; /* single battle, 240 seconds: the game's defaults */
+
+void Port_NetRulesSet(int type, int dp, int time) {
+    sRules = (uint32_t)(type < 0 || type > 2 ? 0 : type) | (uint32_t)(dp < 0 || dp > 2 ? 0 : dp) << 4 | (uint32_t)(time < 0 || time > 4 ? 3 : time) << 8;
+}
+
+void Port_NetRules(int *type, int *dp, int *time) {
+    *type = (int)(sRules & 15) > 2 ? 0 : (int)(sRules & 15);
+    *dp = (int)(sRules >> 4 & 15) > 2 ? 0 : (int)(sRules >> 4 & 15);
+    *time = (int)(sRules >> 8 & 15) > 4 ? 3 : (int)(sRules >> 8 & 15);
 }
 
 /* The input delay for a line with this round trip. A blank is 16.7 ms; the other side's input for a blank is
@@ -210,6 +227,9 @@ static int receive(void) {
             memcpy(v, pkt + 8, 8);
             sCfgDelay = (int)v[0];
             sCfgRoll = (int)v[1];
+            if (n >= 24) {
+                memcpy(&sRules, pkt + 20, 4);
+            }
             sCfgGot = 2;
             sendto(sSock, (const char *)ack, sizeof(ack), 0, (struct sockaddr *)&from, sizeof(from));
         } else if (type == T_CONFIG_ACK && sMode == 1) {
@@ -222,7 +242,7 @@ static int receive(void) {
                 fprintf(stderr, "bt3: net: a copy of another version tried to join; both players need the same release\n");
             }
         } else if (type == T_HELLO && sMode == 1) {
-            uint32_t ack[5] = {MAGIC, T_HELLO_ACK, (uint32_t)sDelay, (uint32_t)sRollMax, NET_VERSION};
+            uint32_t ack[6] = {MAGIC, T_HELLO_ACK, (uint32_t)sDelay, (uint32_t)sRollMax, NET_VERSION, sRules};
             sPeer = from; /* the host learns the other side's address from its greeting */
             sConnected = 1;
             sendto(sSock, (const char *)ack, sizeof(ack), 0, (struct sockaddr *)&sPeer, sizeof(sPeer));
@@ -234,6 +254,9 @@ static int receive(void) {
                 memcpy(v, pkt + 8, 8);
                 sCfgDelay = (int)v[0];
                 sCfgRoll = (int)v[1];
+                if (n >= 24) {
+                    memcpy(&sRules, pkt + 20, 4);
+                }
                 sCfgGot = 1;
                 sConnected = 1;
             }
@@ -309,6 +332,9 @@ static void net_start(int role, const char *host, const char *join) {
     fcntl(sSock, F_SETFL, fcntl(sSock, F_GETFL, 0) | O_NONBLOCK);
 #endif
     sMe = sMode - 1;
+    if (getenv("BT3_NET_RULES") != NULL) { /* (the host's, across the restart into the session, or for a test) */
+        sRules = (uint32_t)strtoul(getenv("BT3_NET_RULES"), NULL, 0);
+    }
     sAutoDelay = getenv("BT3_NET_DELAY") != NULL ? strcmp(getenv("BT3_NET_DELAY"), "auto") == 0 : sOptAuto;
     sDelay = getenv("BT3_NET_DELAY") != NULL && !sAutoDelay ? atoi(getenv("BT3_NET_DELAY")) : sOptDelay >= 0 ? sOptDelay : 2;
     sSetupRtt = -1;
@@ -420,7 +446,7 @@ static void net_start(int role, const char *host, const char *join) {
         while (!sCfgAcked && SDL_GetTicksNS() - start < 3000000000ull) {
             uint64_t now = SDL_GetTicksNS();
             if (now - lastCfg >= 50000000ull) {
-                uint32_t cfg[5] = {MAGIC, T_CONFIG, (uint32_t)sDelay, (uint32_t)sRollMax, NET_VERSION};
+                uint32_t cfg[6] = {MAGIC, T_CONFIG, (uint32_t)sDelay, (uint32_t)sRollMax, NET_VERSION, sRules};
                 sendto(sSock, (const char *)cfg, sizeof(cfg), 0, (struct sockaddr *)&sPeer, sizeof(sPeer));
                 lastCfg = now;
             }
@@ -755,6 +781,12 @@ static void relaunch(int role, const char *join, int port) {
             SETENV("BT3_NET_JOIN", value);
         }
         SETENV("BT3_NET_SESSION", "1");
+        if (role == 1) {
+            snprintf(value, sizeof(value), "%u", (unsigned)sRules);
+            SETENV("BT3_NET_RULES", value);
+        } else {
+            SETENV("BT3_NET_RULES", NULL);
+        }
         SETENV("BT3_SOUND_TICKS", "1");
         SETENV("BT3_NOMOVIE", "1");
         if (getenv("BT3_NET_VOICE") == NULL) { /* (before the save folder changes: it is read from the player's own) */

@@ -1,5 +1,8 @@
 #include "common.h"
 #include "menu/menu_g.h"
+#ifdef PORT
+extern int Port_NetSession(void); /* port/src/gs/net.c */
+#endif
 
 /*
  * Duel_Main, 0x352CB8..0x352EC0: the handler of progress modes 38..41 (main-menu item 3, the duel mode).
@@ -51,6 +54,14 @@ s32 Duel_Main(void) {
                 Adx_StopAll();
                 bgm = 0;
                 gProgress->mode = 38;
+#ifdef PORT /* PC build, online session: there is no versus menu in it; going back leaves for the main menu, which
+               ends the session (as cancelling the versus menu does) */
+                if (Port_NetSession()) {
+                    gProgress->mode = 4;
+                    result = 0;
+                    done = 1;
+                }
+#endif
             }
             break;
         case 40:
@@ -62,6 +73,14 @@ s32 Duel_Main(void) {
                 Adx_StopAll();
                 bgm = 0;
                 gProgress->mode = 38;
+#ifdef PORT /* PC build, online session: there is no versus menu in it; going back leaves for the main menu, which
+               ends the session (as cancelling the versus menu does) */
+                if (Port_NetSession()) {
+                    gProgress->mode = 4;
+                    result = 0;
+                    done = 1;
+                }
+#endif
             }
             break;
         case 41:

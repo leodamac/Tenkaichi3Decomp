@@ -93,6 +93,8 @@ static void port_stage_replace_init(void) {
     }
 }
 
+extern void Port_NetRules(int *type, int *dp, int *time); /* gs/net.c */
+
 int __wrap_Progress_Main(int arg) {
     const char *path;
     PortStages_Init();
@@ -114,11 +116,23 @@ int __wrap_Progress_Main(int arg) {
                    They are set here, so the session opens on the character select itself. Going back from it
                    leads to the versus menu, where the host can change the battle type; back from there ends the
                    session. (After a battle the game itself returns to mode 39.) */
-                gProgress->mode = 39;
-                *(int *)((char *)gProgress + 0x620) = 1;
-                *(int *)((char *)gProgress + 0x624) = 0;
-                *(int *)((char *)gProgress + 0x630) = 0;
-                Save_UnlockAll(gSaveData);
+                /* Since 0.1.15 the host chooses the battle type, the DP limit and the time limit in the lobby window
+                   (gs/net.c: Port_NetRules, the same on both sides). The versus menu is not shown at all: a team
+                   or DP battle opens on the team select (mode 40), and going back from either select ends the
+                   session (Duel_Main). The time limit is rule 0 of the battle settings in the save (+0xC34). */
+                {
+                    int type, dp, time;
+                    Port_NetRules(&type, &dp, &time);
+                    gProgress->mode = type != 0 ? 40 : 39;
+                    *(int *)((char *)gProgress + 0x620) = 1;
+                    *(int *)((char *)gProgress + 0x624) = type;
+                    *(int *)((char *)gProgress + 0x630) = dp;
+                    Save_UnlockAll(gSaveData);
+                    *(int *)((char *)gSaveData + 0xC34) = time;
+                    fprintf(stderr, "bt3: net: rules: %s%s, time limit %s\n", type == 0 ? "single battle" : type == 1 ? "team battle" : "DP battle",
+                            type == 2 ? (dp == 0 ? " (10)" : dp == 1 ? " (15)" : " (20)") : "",
+                            time == 0 ? "60" : time == 1 ? "90" : time == 2 ? "180" : time == 3 ? "240" : "none");
+                }
             }
             gPortMenuMode = 1; /* the renderer treats all 2D as one centred 4:3 page while the menus run */
             r = __real_Progress_Main(arg);
