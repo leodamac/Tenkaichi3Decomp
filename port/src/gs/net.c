@@ -454,6 +454,11 @@ static void net_start(int role, const char *host, const char *join) {
     }
 }
 
+/* Which player this copy plays in an online match (0 the host, 1 the one who joined). */
+int Port_NetMe(void) {
+    return sMe;
+}
+
 int Port_NetActive(void) {
     if (sMode < 0) { /* first asked: connected from the start if the environment says so */
         const char *host = getenv("BT3_NET_HOST"), *join = getenv("BT3_NET_JOIN");

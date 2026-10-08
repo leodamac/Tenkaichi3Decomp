@@ -34,6 +34,8 @@ const char *PortSongs_Name(int index);
 int PortSongs_Count(void);
 int Port_Setting(const char *name, int def);   // plat_settings.c
 void Port_SettingSave(const char *name, int value);
+int Port_ClashSquare(void);                    // gs_input.c: Square counts as a direction in clashes
+void Port_ClashSquareSet(int on);
 extern int gsInterp;                           // gs_draw.c: in-between pictures on (1) / off (0); -1 before the first frame
 void Port_SettingsWrite(void);
 int Port_LobbyStart(int host, const char *address, int port); // gs/net.c
@@ -715,7 +717,19 @@ static void build(void) {
             if (tab("Video", 0)) { video_tab(v); ImGui::EndTabItem(); }
             if (tab("Effects", 1)) { effects_tab(v); ImGui::EndTabItem(); }
             if (tab("Audio", 2)) { audio_tab(v); ImGui::EndTabItem(); }
-            if (tab("Controls", 3)) { controls_tab(); ImGui::EndTabItem(); }
+            if (tab("Controls", 3)) {
+                bool cs = Port_ClashSquare() != 0;
+                if (ImGui::Checkbox("Clashes: Square counts as a direction", &cs)) {
+                    Port_ClashSquareSet(cs);
+                }
+                ImGui::SetItemTooltip("In a clash of two beams or two rushes the game counts newly pressed directions:\n"
+                                      "turning the stick, or tapping the d-pad. With this on, each press of Square\n"
+                                      "counts as one of them while the clash lasts, as a tap of the d-pad does.\n"
+                                      "It only changes your own pad, so it can be used in online play.");
+                ImGui::Separator();
+                controls_tab();
+                ImGui::EndTabItem();
+            }
             if (tab("Cheats", 4)) { cheats_tab(); ImGui::EndTabItem(); }
             ImGui::EndTabBar();
         }

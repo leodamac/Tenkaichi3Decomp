@@ -221,6 +221,68 @@ static unsigned char axis(SDL_Gamepad *g, SDL_GamepadAxis a) {
 
 /* Fills `data` (18 bytes) for controller port `socket`. Returns 0 when there is no window (the caller keeps the
    idle pad). */
+/* "Clashes: Square counts as a direction" (setting clash_square, off by default; BT3_CLASH_SQUARE=1).
+ *
+ * In a clash (two beams or two rushes meeting) the game counts one thing: the frames in which a direction is newly
+ * pressed (input 51 = BTLC_DIR_P; BtlAct_ClashStruggleHandler and BtlAct_ClashBlowsHandler). Turning the stick is
+ * the usual way to make them, four a turn; tapping directions makes them as well. With the setting on, while this
+ * player's fighter is in a clash action, Square is taken off the pad and each press of it holds the stick in the
+ * next of up, right, down, left for as long as it is held: one press, one newly pressed direction, as a tap of
+ * the d-pad gives. The stick and the d-pad go on working beside it.
+ *
+ * This is done to the pad's own bytes, before they reach the game or the other player of an online match: the
+ * game sees an ordinary pad, so the two copies of an online match compute the same fight whoever has it on. */
+static int sClashSquare = -1;
+
+int Port_ClashSquare(void) {
+    if (sClashSquare < 0) {
+        sClashSquare = getenv("BT3_CLASH_SQUARE") != NULL ? atoi(getenv("BT3_CLASH_SQUARE")) != 0 : Port_Setting("clash_square", 0) != 0;
+    }
+    return sClashSquare;
+}
+
+void Port_ClashSquareSet(int on) {
+    sClashSquare = on != 0;
+    Port_SettingSave("clash_square", sClashSquare);
+    Port_SettingsWrite();
+}
+
+static void clash_square(int socket, unsigned *btn, unsigned char *lx, unsigned char *ly) {
+    extern void *BtlChar_FindByObjId(int objId); /* the game: the fighter of a side, NULL outside a fight */
+    extern int BtlAct_GetCurrent(void *chr);     /* its action */
+    extern int Port_NetActive(void), Port_NetMe(void);
+    static int dir[2], was[2];
+    int side = Port_NetActive() ? Port_NetMe() : socket, in = 0, down = (*btn & B_SQUARE) != 0;
+    void *chr;
+
+    if (!Port_ClashSquare()) {
+        return;
+    }
+    if (getenv("BT3_CLASH_TEST") != NULL) {
+        in = 1; /* testing: as if in a clash all the time */
+    } else if ((chr = BtlChar_FindByObjId(side)) != NULL) {
+        int action = BtlAct_GetCurrent(chr);
+        in = (action >= 0x130 && action <= 0x132) || action == 0xFA || action == 0xFB || action == 0xFC;
+    }
+    if (!in) {
+        was[socket] = down; /* (a Square held into the clash is not a press in it) */
+        return;
+    }
+    if (down && !was[socket]) {
+        dir[socket] = (dir[socket] + 1) & 3;
+    }
+    was[socket] = down;
+    *btn &= ~(unsigned)B_SQUARE;
+    if (down) {
+        switch (dir[socket]) {
+        case 0: *ly = 0x00; break; /* up */
+        case 1: *lx = 0xFF; break; /* right */
+        case 2: *ly = 0xFF; break; /* down */
+        default: *lx = 0x00; break; /* left */
+        }
+    }
+}
+
 int Port_PadRead(int socket, unsigned char *data) {
     unsigned btn = 0;
     unsigned char rx = 0x80, ry = 0x80, lx = 0x80, ly = 0x80;
@@ -267,6 +329,7 @@ int Port_PadRead(int socket, unsigned char *data) {
     if (socket == 0) {
         btn |= script_buttons();
     }
+    clash_square(socket, &btn, &lx, &ly);
     memset(data, 0, 18);
     data[0] = (unsigned char)(~btn & 0xFF);       /* active low */
     data[1] = (unsigned char)(~(btn >> 8) & 0xFF);
