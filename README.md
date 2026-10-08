@@ -18,8 +18,12 @@ game's data from it, and it stays on your computer.
   on the console; with this the renderer draws pictures in between, for 60, 120 or 240 a second. The fight itself,
   replays and online play are unchanged, and the two players of an online match need not agree on it. The newest
   picture reaches the screen 17 to 29 ms later than without. Known limits: pictures are left out at camera cuts
-  and where the camera would pass through scenery; 240 is uneven; little tested with OpenGL.
+  and where the camera would pass through scenery; 240 is uneven; little tested with OpenGL. Works in both halves
+  of a split screen.
 - Music, voices and sound effects; keyboard and controllers, fully rebindable; two players.
+- Clashes: Square counts as a direction (off by default; F1, Controls): in a clash of two beams or two rushes the
+  game counts newly pressed directions, which is why the stick is turned; with this each press of Square counts as
+  one, as a tap of the d-pad does. It changes only your own pad, so it can be used online.
 - Texture packs made for PCSX2 (`.dds` or `.png`): copied into the `textures` folder next to the game, they are used as they are.
 - Stages and music from outside the disc: a stage model (`.unk`) dropped into the `stages` folder next to the
   game, or a song (`.adx`) into `songs`, is added to the stage select, its name written in the game's own
@@ -35,10 +39,14 @@ game's data from it, and it stays on your computer.
   the match puts each player back where they were with their own save. Linux and Windows play against each
   other. With rollback (the host chooses how many frames, and the input delay) your own moves come out at once
   and the game corrects itself when the other player's buttons arrive.
+  The host also chooses the battle (single, team, or DP battle with a limit of 10, 15 or 20) and the time limit.
+  Each player sees their own gauges on the left with the players' names under them, and hears the voice language
+  chosen in their own save.
 
 Online play is new. It has been played over the internet between a Linux and a Windows machine. The input delay
 is chosen from the connection when a match starts (or set by the host), both players need the same release (the
-game says so when they differ; 0.1.10 does not play against 0.1.8 / 0.1.9), and the host's port has to be
+game says so when they differ; 0.1.10 does not play against 0.1.8 / 0.1.9, and 0.1.15 does not play against
+0.1.14 and earlier), and the host's port has to be
 reachable from the other player (port forwarding, or a virtual network such as Tailscale; there is no relay or
 match-making). F1, Video has a meter for the frame rate and, in a match, the ping, rollbacks and waits. The 32-bit
 Linux build has no rollback. [docs/netplay_notes.md](docs/netplay_notes.md) is the working log of how it is built
