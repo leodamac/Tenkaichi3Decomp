@@ -34,6 +34,7 @@ const char *PortSongs_Name(int index);
 int PortSongs_Count(void);
 int Port_Setting(const char *name, int def);   // plat_settings.c
 void Port_SettingSave(const char *name, int value);
+extern int gsInterp;                           // gs_draw.c: in-between pictures on (1) / off (0); -1 before the first frame
 void Port_SettingsWrite(void);
 int Port_LobbyStart(int host, const char *address, int port); // gs/net.c
 int Port_LobbyPoll(void);
@@ -530,6 +531,19 @@ static void video_tab(PortVideo &v) {
         if (api != (sGL ? 1 : 0)) {
             ImGui::TextDisabled("Running now: %s. %s from the next start.", kApi[sGL ? 1 : 0], kApi[api]);
         }
+    }
+    {
+        // In-between pictures (gs_draw.c): the fight is computed 30 times a second, as on the console; with this
+        // on one more picture is drawn between each two. The game itself, its replays and online play are the same.
+        bool on = gsInterp > 0;
+        if (ImGui::Checkbox("Smooth motion: 60 pictures a second in fights (experimental)", &on)) {
+            gsInterp = on ? 1 : 0;
+            Port_SettingSave("interp", gsInterp);
+            Port_SettingsWrite();
+        }
+        ImGui::SetItemTooltip("The game computes a fight 30 times a second. With this on, one more picture is drawn\n"
+                              "between each two, half way. The fight itself does not change, and neither does online play.\n"
+                              "The newest picture reaches the screen about 17 ms later than without. F9 switches it too.");
     }
     {
         bool on = meter_on();

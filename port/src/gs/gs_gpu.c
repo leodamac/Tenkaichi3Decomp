@@ -511,9 +511,13 @@ static void vk_frame_end(void) {
         if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) {
             exit(0);
         }
-        if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.key == SDLK_F9) { /* prototype: in-between pictures on / off */
+        if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.key == SDLK_F9) { /* in-between pictures on / off */
             extern int gsInterp;
-            gsInterp = gsInterp > 0 ? 0 : 1;
+            extern void Port_SettingSave(const char *name, int value);
+            extern void Port_SettingsWrite(void);
+            gsInterp = gsInterp > 0 ? 0 : 1; /* (the same setting as F1, Video, Smooth motion) */
+            Port_SettingSave("interp", gsInterp);
+            Port_SettingsWrite();
             fprintf(stderr, "bt3: in-between pictures %s\n", gsInterp ? "ON" : "off");
         }
         if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.key == SDLK_F11) {
