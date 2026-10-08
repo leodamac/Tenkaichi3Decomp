@@ -53,6 +53,11 @@ See [docs/port/README.md](docs/port/README.md) for the running log of what is do
 Unpack the release, start `Tenkaichi3Decomp-setup` (`Tenkaichi3Decomp-setup.exe` on Windows), choose your disc image, press Play. The
 setup checks that the image is the unmodified USA release and unpacks the game's data next to the program.
 
+On a machine without a working Vulkan the setup window and the game use OpenGL by themselves. To ask for OpenGL
+from the start (a Vulkan driver that starts but is incomplete, as on Intel Ivy Bridge), set `BT3_GPU_API=gl`:
+`BT3_GPU_API=gl ./Tenkaichi3Decomp-setup`, and the same for `./Tenkaichi3Decomp`. The setup also runs without a
+window: `./Tenkaichi3Decomp-setup --install <disc image>`.
+
 ## Building from source
 
 ```

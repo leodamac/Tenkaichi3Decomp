@@ -18,6 +18,8 @@
 #include "imgui.h"
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_sdlgpu3.h"
+#include "imgui_impl_opengl3.h"
+#include "imgui_impl_opengl3_loader.h" // glViewport, glClear for the OpenGL window (set up by ImGui_ImplOpenGL3_Init)
 #include "native.h"
 
 #define GAME "Tenkaichi3Decomp" /* the program this sets up: GAME, GAME.dat; this program is GAME-setup */
@@ -48,6 +50,11 @@ static const char *step_help(const std::string &title) {
 
 static SDL_Window *sWindow;
 static SDL_GPUDevice *sDevice;
+// The window is drawn through SDL's GPU layer (Vulkan on Linux, Direct3D 12 on Windows) or, where that cannot
+// start (no Vulkan driver, a graphics chip too old for it: reported for Intel Ivy Bridge), through OpenGL.
+// BT3_GPU_API=gl asks for OpenGL at once, as it does for the game.
+static SDL_GLContext sGl;
+static bool sUseGl;
 static Page sPage = PAGE_PICK;
 static char sIso[1024];
 static std::string sRoot, sError, sLauncher, sLine;
@@ -632,13 +639,57 @@ int main(int argc, char **argv) {
         fprintf(stderr, GAME "-setup: %s\n", SDL_GetError());
         return 1;
     }
-    sWindow = SDL_CreateWindow(GAME " - Setup", 760, 560, SDL_WINDOW_HIGH_PIXEL_DENSITY);
-    sDevice = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL, false, NULL);
-    if (sWindow == NULL || sDevice == NULL || !SDL_ClaimWindowForGPUDevice(sDevice, sWindow)) {
-        fprintf(stderr, GAME "-setup: no window: %s\nThe same setup runs in a terminal: python3 install.py\n", SDL_GetError());
-        return 1;
+    const char *glsl = "#version 330";
+    {
+        const char *api = getenv("BT3_GPU_API");
+        bool wantGl = api != NULL && (strcmp(api, "gl") == 0 || strcmp(api, "opengl") == 0);
+        std::string why;
+        if (!wantGl) {
+            sWindow = SDL_CreateWindow(GAME " - Setup", 760, 560, SDL_WINDOW_HIGH_PIXEL_DENSITY);
+            sDevice = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL, false, NULL);
+            if (sWindow == NULL || sDevice == NULL || !SDL_ClaimWindowForGPUDevice(sDevice, sWindow)) {
+                why = SDL_GetError();
+                if (sDevice != NULL) {
+                    SDL_DestroyGPUDevice(sDevice);
+                    sDevice = NULL;
+                }
+                if (sWindow != NULL) {
+                    SDL_DestroyWindow(sWindow);
+                    sWindow = NULL;
+                }
+            }
+        }
+        if (sDevice == NULL) {
+            // OpenGL 3.3 core, and failing that whatever 3.0 context the driver gives
+            for (int attempt = 0; attempt < 2 && sGl == NULL; attempt++) {
+                SDL_GL_ResetAttributes();
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, attempt == 0 ? 3 : 0);
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, attempt == 0 ? SDL_GL_CONTEXT_PROFILE_CORE : 0);
+                SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+                glsl = attempt == 0 ? "#version 330" : "#version 130";
+                sWindow = SDL_CreateWindow(GAME " - Setup", 760, 560, SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_OPENGL);
+                sGl = sWindow != NULL ? SDL_GL_CreateContext(sWindow) : NULL;
+                if (sGl == NULL && sWindow != NULL) {
+                    SDL_DestroyWindow(sWindow);
+                    sWindow = NULL;
+                }
+            }
+            if (sGl == NULL) {
+                fprintf(stderr, GAME "-setup: no window: %s%s%s\nThe same setup runs without a window: " GAME "-setup --install <disc image>\n",
+                        why.c_str(), why.empty() ? "" : "; OpenGL: ", SDL_GetError());
+                return 1;
+            }
+            if (!wantGl) {
+                fprintf(stderr, GAME "-setup: %s; the window uses OpenGL\n", why.c_str());
+            }
+            SDL_GL_MakeCurrent(sWindow, sGl);
+            SDL_GL_SetSwapInterval(1);
+            sUseGl = true;
+        } else {
+            SDL_SetGPUSwapchainParameters(sDevice, sWindow, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, SDL_GPU_PRESENTMODE_VSYNC);
+        }
     }
-    SDL_SetGPUSwapchainParameters(sDevice, sWindow, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, SDL_GPU_PRESENTMODE_VSYNC);
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
@@ -650,11 +701,16 @@ int main(int argc, char **argv) {
             break;
         }
     }
-    ImGui_ImplSDL3_InitForSDLGPU(sWindow);
-    info.Device = sDevice;
-    info.ColorTargetFormat = SDL_GetGPUSwapchainTextureFormat(sDevice, sWindow);
-    info.MSAASamples = SDL_GPU_SAMPLECOUNT_1;
-    ImGui_ImplSDLGPU3_Init(&info);
+    if (sUseGl) {
+        ImGui_ImplSDL3_InitForOpenGL(sWindow, sGl);
+        ImGui_ImplOpenGL3_Init(glsl);
+    } else {
+        ImGui_ImplSDL3_InitForSDLGPU(sWindow);
+        info.Device = sDevice;
+        info.ColorTargetFormat = SDL_GetGPUSwapchainTextureFormat(sDevice, sWindow);
+        info.MSAASamples = SDL_GPU_SAMPLECOUNT_1;
+        ImGui_ImplSDLGPU3_Init(&info);
+    }
     sRoot = find_root();
     if (sRelease && Native_Installed(sRoot) && getenv("BT3_SETUP_ISO") == NULL) { // nothing left to do: offer Play
         reset_rows();
@@ -692,12 +748,46 @@ int main(int argc, char **argv) {
             }
         }
         pump_install();
-        ImGui_ImplSDLGPU3_NewFrame();
+        if (sUseGl) {
+            ImGui_ImplOpenGL3_NewFrame();
+        } else {
+            ImGui_ImplSDLGPU3_NewFrame();
+        }
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
         build_ui();
         ImGui::Render();
         ImDrawData *dd = ImGui::GetDrawData();
+        if (sUseGl) {
+            int pw = 0, ph = 0;
+            SDL_GetWindowSizeInPixels(sWindow, &pw, &ph);
+            glViewport(0, 0, pw, ph);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            ImGui_ImplOpenGL3_RenderDrawData(dd);
+            if (getenv("BT3_SETUP_SHOT") != NULL && ImGui::GetFrameCount() == 20 && pw > 0 && ph > 0) {
+                // testing: the picture of the OpenGL window, <BT3_SETUP_SHOT>_gl.ppm (rows come bottom first)
+                std::vector<unsigned char> px((size_t)pw * ph * 4);
+                char name[512];
+                glReadPixels(0, 0, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                snprintf(name, sizeof(name), "%s_gl.ppm", getenv("BT3_SETUP_SHOT"));
+                FILE *fp = fopen(name, "wb");
+                if (fp != NULL) {
+                    fprintf(fp, "P6\n%d %d\n255\n", pw, ph);
+                    for (int y = ph - 1; y >= 0; y--) {
+                        for (int x = 0; x < pw; x++) {
+                            fwrite(&px[((size_t)y * pw + x) * 4], 1, 3, fp);
+                        }
+                    }
+                    fclose(fp);
+                }
+            }
+            SDL_GL_SwapWindow(sWindow);
+            if (getenv("BT3_SETUP_QUIT") != NULL && ImGui::GetFrameCount() > 30) {
+                sQuit = true; // testing: a few frames of the OpenGL window, then leave
+            }
+            continue;
+        }
         SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(sDevice);
         SDL_GPUTexture *swap = NULL;
         Uint32 w = 0, h = 0;
@@ -734,6 +824,15 @@ int main(int argc, char **argv) {
         SDL_DestroyProcess(sProc);
     }
     Native_Join();
+    if (sUseGl) {
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
+        SDL_GL_DestroyContext(sGl);
+        SDL_DestroyWindow(sWindow);
+        SDL_Quit();
+        return 0;
+    }
     SDL_WaitForGPUIdle(sDevice);
     ImGui_ImplSDL3_Shutdown();
     ImGui_ImplSDLGPU3_Shutdown();
