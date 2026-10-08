@@ -2499,9 +2499,115 @@ static uint32_t interp_prims(InterpPrim *out) {
     return count;
 }
 
+/* Which kinds of piece stand still in the world, asked corner by corner and once a tick: a kind does if most of a
+   sample of its corners, taken back by the camera's change, lie on corners of the same kind in the previous picture.
+   (Asked piece by piece it missed what is cut into pieces differently in every picture: the sheets of a waterfall,
+   long strips that are cut at the screen's edge. Their pieces were paired by nearness with other parts of the
+   sheet and the fall was pinched or grew a wedge in the in-between pictures.) */
+#define INTERP_MAX_KINDS 512
+static struct { uint32_t kind, count, seen, tested, landed; uint8_t flat, isStatic; } sInterpKinds[INTERP_MAX_KINDS];
+static uint32_t sInterpKindCount;
+static uint32_t *sInterpPrevByKind;
+
+static int interp_bykind_cmp(const void *a, const void *b) {
+    uint32_t x = sInterpPrevPrims[*(const uint32_t *)a].kind, y = sInterpPrevPrims[*(const uint32_t *)b].kind;
+    return x < y ? -1 : x > y;
+}
+
+static int interp_kind_find(uint32_t kind, int add) {
+    uint32_t k;
+
+    for (k = 0; k < sInterpKindCount; k++) {
+        if (sInterpKinds[k].kind == kind) {
+            return (int)k;
+        }
+    }
+    if (!add || sInterpKindCount == INTERP_MAX_KINDS) {
+        return -1;
+    }
+    memset(&sInterpKinds[sInterpKindCount], 0, sizeof(sInterpKinds[0]));
+    sInterpKinds[sInterpKindCount].kind = kind;
+    return (int)sInterpKindCount++;
+}
+
+static void interp_static_kinds(void) {
+    uint32_t i, j;
+
+    sInterpKindCount = 0;
+    if (!sInterpHaveD || sInterpPrevPrimCount == 0) {
+        return;
+    }
+    if (sInterpPrevByKind == NULL) {
+        sInterpPrevByKind = malloc(INTERP_MAX_PRIMS * sizeof(uint32_t));
+    }
+    for (i = 0; i < sInterpPrevPrimCount; i++) {
+        sInterpPrevByKind[i] = i;
+    }
+    qsort(sInterpPrevByKind, sInterpPrevPrimCount, sizeof(uint32_t), interp_bykind_cmp);
+    for (i = 0; i < sInterpPrimCount; i++) {
+        int e = interp_kind_find(sInterpPrims[i].kind, 1);
+        if (e >= 0) {
+            sInterpKinds[e].count++;
+            sInterpKinds[e].flat |= sInterpPrims[i].flat2d;
+        }
+    }
+    for (i = 0; i < sInterpPrimCount; i++) {
+        const InterpPrim *c = &sInterpPrims[i];
+        int e = interp_kind_find(c->kind, 0), k, nv = c->tris * 3;
+        uint32_t stride, a, b;
+        if (e < 0 || sInterpKinds[e].flat) {
+            continue;
+        }
+        stride = sInterpKinds[e].count / 16 + 1;
+        if (sInterpKinds[e].seen++ % stride != 0) {
+            continue;
+        }
+        /* the previous picture's pieces of the kind: a range of the list sorted by kind */
+        a = 0;
+        b = sInterpPrevPrimCount;
+        while (a < b) {
+            uint32_t m = (a + b) / 2;
+            if (sInterpPrevPrims[sInterpPrevByKind[m]].kind < c->kind) { a = m + 1; } else { b = m; }
+        }
+        for (k = 0; k < nv; k += 2) { /* (every other corner) */
+            const Vtx *cv = &gsVerts[c->first + k];
+            float px, py, pz;
+            int found = 0;
+            if (!interp_reproject(cv, &px, &py, &pz)) {
+                continue;
+            }
+            sInterpKinds[e].tested++;
+            for (j = a; j < sInterpPrevPrimCount && !found; j++) {
+                const InterpPrim *q = &sInterpPrevPrims[sInterpPrevByKind[j]];
+                const Vtx *pv = &sInterpPrevVerts[q->first];
+                int m, n2 = q->tris * 3;
+                if (q->kind != c->kind) {
+                    break;
+                }
+                for (m = 0; m < n2; m++) {
+                    if (fabsf(pv[m].x - px) <= 1.0f && fabsf(pv[m].y - py) <= 1.0f) {
+                        found = 1;
+                        break;
+                    }
+                }
+            }
+            sInterpKinds[e].landed += found;
+        }
+    }
+    for (i = 0; i < sInterpKindCount; i++) {
+        sInterpKinds[i].isStatic = sInterpKinds[i].tested >= 2 && sInterpKinds[i].landed * 10 >= sInterpKinds[i].tested * 6;
+    }
+}
+
 static void interp_build_verts(float t) {
     uint32_t i, lo = 0;
     int staticKind = 0;
+    static unsigned forFrame = ~0u;
+
+    if (forFrame != gGsFrame) {
+        forFrame = gGsFrame;
+        interp_static_kinds();
+    }
 
     memcpy(sInterpBlendVerts, gsVerts, gsVertCount * sizeof(Vtx));
     memset(sInterpPrimUsed, 0, sInterpPrevPrimCount);
@@ -2561,6 +2667,28 @@ static void interp_build_verts(float t) {
                 }
                 fprintf(stderr, "kind %08x tris %d: %u now, %u before; tested %u, landed %u; first corner %.1f,%.1f q %.5f -> by the camera %.1f,%.1f (%d), nearest first corner before %.1f away\n", c->kind, c->tris, end - i, pEnd - lo, tested, okS,
                         cv[0].x, cv[0].y, cv[0].q, bx, by, can, bd);
+            }
+        }
+        {
+            int e = interp_kind_find(sInterpPrims[i].kind, 0);
+            int byCorners = e >= 0 && sInterpKinds[e].isStatic;
+            if (getenv("BT3_INTERP_DUMP") != NULL && (int)gGsFrame == atoi(getenv("BT3_INTERP_DUMP")) && e >= 0) {
+                fprintf(stderr, "  kind %08x by corners: %u pieces, %u corners tested, %u landed -> %d (by pieces %d)\n", sInterpPrims[i].kind, sInterpKinds[e].count, sInterpKinds[e].tested, sInterpKinds[e].landed, byCorners, staticKind);
+            }
+            if (byCorners && !staticKind) {
+                /* all of them, also those with nothing like them before */
+                uint32_t r3;
+                sInterpTrust = 1;
+                for (r3 = 0; r3 < end - i; r3++) {
+                    if (interp_piece_camera(&sInterpPrims[i + r3], t)) {
+                        gInterpTrisCamera++;
+                        gInterpStatic++;
+                    }
+                }
+                sInterpTrust = 0;
+                i = end;
+                lo = pEnd;
+                continue;
             }
         }
         if (pEnd == lo) {
