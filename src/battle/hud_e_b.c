@@ -42,6 +42,13 @@ typedef struct HudPromptObj {
 
 /* Sprite / node library at 0x224B50.. (neighbouring ranges). */
 extern void HudSprite_Show(HudESprite *spr, s32 show);
+#ifdef PORT
+/* PC build, online play: the player who joined is side 1 of the game, and would have their own gauges, team, prompts
+   and counters on the right. With the swap (gs/net.c) the two sides change places on THIS copy's screen only: a
+   side's data is the same, where it is drawn is the other side's place. HUD_SCR(side) is the place of a side. */
+extern int Port_HudSwap(void);
+#define HUD_SCR(side) ((side) ^ Port_HudSwap())
+#endif
 extern void HudSprite_SetMirror(HudESprite *spr, s32 mirror);
 extern void HudSprite_SetRect(HudESprite *spr, s32 x0, s32 x1, s32 y0, s32 y1); /* screen rectangle */
 extern void HudSprite_SetUv(HudESprite *spr, s32 u0, s32 u1, s32 v0, s32 v1); /* texel rectangle */
@@ -443,11 +450,11 @@ void HudPrompt_UpdateButton(HudENode *node) {
     } else {
         HudSprite_InitTex(icon, gHudPrompt->res, gHudPrompt->btn.value[side] >> 8, 0);
         HudSprite_Center(icon);
-        HudSprite_Move(icon, gHudPrompt->side == 0 ? -14 : 14, 0);
+        HudSprite_Move(icon, HUD_SCR(gHudPrompt->side) == 0 ? -14 : 14, 0);
         HudSprite_Show(icon, 1);
         HudSprite_InitTex(icon2, gHudPrompt->res, (u8)gHudPrompt->btn.value[side], 0);
         HudSprite_Center(icon2);
-        HudSprite_Move(icon2, gHudPrompt->side ? -12 : 12, 0);
+        HudSprite_Move(icon2, HUD_SCR(gHudPrompt->side) ? -12 : 12, 0);
         HudSprite_Show(icon2, 1);
     }
     if (HudPrompt_StepRamp(pulse)) {
@@ -477,8 +484,8 @@ void HudPrompt_UpdateButton(HudENode *node) {
         a = alpha * HUDP_MAX2(0.0f, alpha);
         HudSprite_SetColor(glow, 0x80, 0x80, 0x80, (u8)(a * 128.0f));
     }
-    HudSprite_SetMirror(icon, gHudPrompt->btn.flip[side] ^ side);
-    HudSprite_SetMirror(icon2, gHudPrompt->btn.flip[side] ^ side);
+    HudSprite_SetMirror(icon, gHudPrompt->btn.flip[side] ^ HUD_SCR(side));
+    HudSprite_SetMirror(icon2, gHudPrompt->btn.flip[side] ^ HUD_SCR(side));
     HudSprite_Move(base, 1, -2);
 }
 
@@ -807,7 +814,7 @@ void HudPrompt_UpdateCommand(HudENode *node) {
         HudSprite_SetColor(&icon[i], 0x80, 0x80, 0x80, (u8)(ramp->value * 128.0f));
     }
     for (i = 0; i < count; i++) {
-        if (gHudPrompt->side != 0) {
+        if (HUD_SCR(gHudPrompt->side) != 0) {
             HudSprite_Move(&icon[i], -(node->x * 2) - x + 512, 0);
             HudSprite_Move(&glow[i], -(node->x * 2) - x + 512, 0);
             HudSprite_Move(&ghost[i], -(node->x * 2) - x + 512, 0);
@@ -815,7 +822,7 @@ void HudPrompt_UpdateCommand(HudENode *node) {
         }
     }
     if (icons[0].mode != 3) {
-        if (gHudPrompt->side != 0) {
+        if (HUD_SCR(gHudPrompt->side) != 0) {
             HUDP_NAME_POS(gHudPrompt->side)->x = icon[0].pos[1];
         } else {
             HUDP_NAME_POS(gHudPrompt->side)->x = icon[0].pos[0];
@@ -858,10 +865,10 @@ void HudPrompt_SelectSide(s32 side) {
 
     gHudPrompt->side = side;
 #ifdef PORT
-    Port_GsMarker(side ? PORT_2D_RIGHT : PORT_2D_LEFT);
+    Port_GsMarker(HUD_SCR(side) ? PORT_2D_RIGHT : PORT_2D_LEFT);
 #endif
     node = &gHudPrompt->node[HUD_PROMPT_NODE_BUTTON];
-    node->mirror = side != 0;
+    node->mirror = HUD_SCR(side) != 0;
 }
 
 /* Shows the cue: restarts it unless it is already coming in or shown. */

@@ -42,6 +42,13 @@ HudTeam *gHudTeam = NULL;
 extern void HudGfx_CallBegin(void (*gsBegin)(void));     /* calls it */
 extern void HudGfx_CallEnd(void (*gsEnd)(void));       /* calls it */
 extern void HudSprite_Show(HudSprite *spr, s32 show);
+#ifdef PORT
+/* PC build, online play: the player who joined is side 1 of the game, and would have their own gauges, team, prompts
+   and counters on the right. With the swap (gs/net.c) the two sides change places on THIS copy's screen only: a
+   side's data is the same, where it is drawn is the other side's place. HUD_SCR(side) is the place of a side. */
+extern int Port_HudSwap(void);
+#define HUD_SCR(side) ((side) ^ Port_HudSwap())
+#endif
 extern void HudSprite_SetMirror(HudSprite *spr, s32 mirror);
 extern void HudSprite_SetRect(HudSprite *spr, s32 x0, s32 x1, s32 y0, s32 y1);
 extern void HudSprite_SetUv(HudSprite *spr, s32 u0, s32 u1, s32 v0, s32 v1);
@@ -321,11 +328,11 @@ extern void Port_GsMarker(s32 effect);
 #endif
 
 void HudTeam_SelectSide(s32 side) {
-    s32 mirror = side != 0;
+    s32 mirror = HUD_SCR(side) != 0;
 
     gHudTeam->side = side;
 #ifdef PORT
-    Port_GsMarker(side ? PORT_2D_RIGHT : PORT_2D_LEFT);
+    Port_GsMarker(HUD_SCR(side) ? PORT_2D_RIGHT : PORT_2D_LEFT);
 #endif
     gHudTeam->nodes[0].flags = (gHudTeam->nodes[0].flags & ~HUD_NODE_MIRROR) | (mirror << 1);
     HudSprite_SetMirror(&gHudTeam->sprites[8], mirror);

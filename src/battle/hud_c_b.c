@@ -4,6 +4,13 @@
 #include "sys/randf.h"
 #include "sys/heap.h"
 
+#ifdef PORT
+/* PC build, online play: the player who joined is side 1 of the game, and would have their own gauges, team, prompts
+   and counters on the right. With the swap (gs/net.c) the two sides change places on THIS copy's screen only: a
+   side's data is the same, where it is drawn is the other side's place. HUD_SCR(side) is the place of a side. */
+extern int Port_HudSwap(void);
+#define HUD_SCR(side) ((side) ^ Port_HudSwap())
+#endif
 /*
  * Battle HUD: the combo part, 0x222730-0x224B50 (the fifth part the manager builds, gHud->combo, from sprite
  * sheet 2). Per side it shows
@@ -116,7 +123,7 @@ void HudCombo_UpdateRoot(HudCNode *node) {
     if (!HUDC_PAUSED() && gHudCombo->side == 0) {
         Ramp_Step(&gHudCombo->hide);
     }
-    if (gHudCombo->side == 0) {
+    if (HUD_SCR(gHudCombo->side) == 0) {
         HudNode_SetPos(node, gHudCombo->hide.value * -256.0f, gHudCombo->hide.value * 0.0f);
     } else {
         HudNode_SetPos(node, gHudCombo->hide.value * 256.0f, gHudCombo->hide.value * 0.0f);
@@ -206,7 +213,7 @@ void HudCombo_UpdateMessage(HudCNode *node) {
     if (msg == 4) {
         pos[1] += 310.0f;
     }
-    if (gHudCombo->side == 0) {
+    if (HUD_SCR(gHudCombo->side) == 0) {
         HudNode_SetOfs(node, pos[0], pos[1]);
     } else {
         HudNode_SetOfs(node, 372 - (s32)pos[0], pos[1]);
@@ -280,7 +287,7 @@ void HudCombo_UpdateText(HudCNode *node) {
     }
     HudSprite_SetColor(spr, 0x80, 0x80, 0x80, alpha);
     pos[0] += 15.0f;
-    if (gHudCombo->side == 0) {
+    if (HUD_SCR(gHudCombo->side) == 0) {
         HudNode_SetOfs(node, pos[0], pos[1]);
     } else {
         HudNode_SetOfs(node, 512 - (s32)pos[0], pos[1]);
@@ -475,7 +482,7 @@ void HudCombo_UpdateDamage(HudCNode *node) {
         break;
     }
     pos[0] += 5.0f;
-    if (gHudCombo->side == 0) {
+    if (HUD_SCR(gHudCombo->side) == 0) {
         HudNode_SetOfs(node, pos[0], pos[1]);
     } else {
         HudNode_SetOfs(node, 372 - (s32)pos[0], pos[1]);
@@ -564,7 +571,7 @@ void HudCombo_UpdateHits(HudCNode *node) {
         break;
     }
     pos[0] += 5.0f;
-    if (gHudCombo->side == 0) {
+    if (HUD_SCR(gHudCombo->side) == 0) {
         HudNode_SetOfs(node, pos[0], pos[1]);
     } else {
         HudNode_SetOfs(node, 372 - (s32)pos[0], pos[1]);
@@ -614,7 +621,7 @@ extern void Port_GsMarker(s32 effect);
 void HudCombo_SelectSide(s32 side) {
     gHudCombo->side = side;
 #ifdef PORT
-    Port_GsMarker(side ? PORT_2D_RIGHT : PORT_2D_LEFT);
+    Port_GsMarker(HUD_SCR(side) ? PORT_2D_RIGHT : PORT_2D_LEFT);
 #endif
 }
 

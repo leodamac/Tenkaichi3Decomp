@@ -85,6 +85,13 @@ void Port_NetOptions(int rollback, int delay) {
     sOptDelay = delay >= 0 ? delay : -1;
 }
 
+#define NAME_LEN 20
+static char sNames[2][NAME_LEN], sMyName[NAME_LEN] = "Player";
+
+void Port_NetNameSet(const char *name) {
+    snprintf(sMyName, sizeof(sMyName), "%s", name != NULL && name[0] != '\0' ? name : "Player");
+}
+
 /* The match's rules, chosen by the host in the lobby window (the game's own versus menu is not shown in a session):
    the battle type as the versus menu leaves it (0 single, 1 team, 2 DP battle), the row of the DP limit list
    (0..2: 10, 15, 20) and the time limit as the battle settings keep it (save rule 0: 0..4 = 60, 90, 180, 240
@@ -230,6 +237,10 @@ static int receive(void) {
             if (n >= 24) {
                 memcpy(&sRules, pkt + 20, 4);
             }
+            if (n >= 24 + NAME_LEN) {
+                memcpy(sNames[0], pkt + 24, NAME_LEN);
+                sNames[0][NAME_LEN - 1] = '\0';
+            }
             sCfgGot = 2;
             sendto(sSock, (const char *)ack, sizeof(ack), 0, (struct sockaddr *)&from, sizeof(from));
         } else if (type == T_CONFIG_ACK && sMode == 1) {
@@ -242,7 +253,13 @@ static int receive(void) {
                 fprintf(stderr, "bt3: net: a copy of another version tried to join; both players need the same release\n");
             }
         } else if (type == T_HELLO && sMode == 1) {
-            uint32_t ack[6] = {MAGIC, T_HELLO_ACK, (uint32_t)sDelay, (uint32_t)sRollMax, NET_VERSION, sRules};
+            uint32_t ack[6 + NAME_LEN / 4] = {MAGIC, T_HELLO_ACK, (uint32_t)sDelay, (uint32_t)sRollMax, NET_VERSION, sRules};
+            memcpy(&ack[6], sMyName, NAME_LEN);
+            if (n >= 12 + NAME_LEN) { /* the other player's name came with the greeting */
+                memcpy(sNames[1], pkt + 12, NAME_LEN);
+                sNames[1][NAME_LEN - 1] = '\0';
+            }
+            memcpy(sNames[0], sMyName, NAME_LEN);
             sPeer = from; /* the host learns the other side's address from its greeting */
             sConnected = 1;
             sendto(sSock, (const char *)ack, sizeof(ack), 0, (struct sockaddr *)&sPeer, sizeof(sPeer));
@@ -257,6 +274,11 @@ static int receive(void) {
                 if (n >= 24) {
                     memcpy(&sRules, pkt + 20, 4);
                 }
+                if (n >= 24 + NAME_LEN) {
+                    memcpy(sNames[0], pkt + 24, NAME_LEN);
+                    sNames[0][NAME_LEN - 1] = '\0';
+                }
+                memcpy(sNames[1], sMyName, NAME_LEN);
                 sCfgGot = 1;
                 sConnected = 1;
             }
@@ -332,6 +354,11 @@ static void net_start(int role, const char *host, const char *join) {
     fcntl(sSock, F_SETFL, fcntl(sSock, F_GETFL, 0) | O_NONBLOCK);
 #endif
     sMe = sMode - 1;
+    if (getenv("BT3_NET_NAME") != NULL) { /* (across the restart into the session) */
+        Port_NetNameSet(getenv("BT3_NET_NAME"));
+    }
+    memset(sNames, 0, sizeof(sNames));
+    memcpy(sNames[sMe], sMyName, NAME_LEN);
     if (getenv("BT3_NET_RULES") != NULL) { /* (the host's, across the restart into the session, or for a test) */
         sRules = (uint32_t)strtoul(getenv("BT3_NET_RULES"), NULL, 0);
     }
@@ -402,7 +429,8 @@ static void net_start(int role, const char *host, const char *join) {
     while (!sConnected) {
         uint64_t now = SDL_GetTicksNS();
         if (sMode == 2 && now - last > 100000000ull) {
-            uint32_t hello[3] = {MAGIC, T_HELLO, NET_VERSION};
+            uint32_t hello[3 + NAME_LEN / 4] = {MAGIC, T_HELLO, NET_VERSION};
+            memcpy(&hello[3], sMyName, NAME_LEN);
             sendto(sSock, (const char *)hello, sizeof(hello), 0, (struct sockaddr *)&sPeer, sizeof(sPeer));
             last = now;
         }
@@ -446,7 +474,8 @@ static void net_start(int role, const char *host, const char *join) {
         while (!sCfgAcked && SDL_GetTicksNS() - start < 3000000000ull) {
             uint64_t now = SDL_GetTicksNS();
             if (now - lastCfg >= 50000000ull) {
-                uint32_t cfg[6] = {MAGIC, T_CONFIG, (uint32_t)sDelay, (uint32_t)sRollMax, NET_VERSION, sRules};
+                uint32_t cfg[6 + NAME_LEN / 4] = {MAGIC, T_CONFIG, (uint32_t)sDelay, (uint32_t)sRollMax, NET_VERSION, sRules};
+                memcpy(&cfg[6], sMyName, NAME_LEN);
                 sendto(sSock, (const char *)cfg, sizeof(cfg), 0, (struct sockaddr *)&sPeer, sizeof(sPeer));
                 lastCfg = now;
             }
@@ -508,6 +537,28 @@ static int own_voice_alt(void) {
 int Port_NetVoiceAlt(void) {
     const char *v = getenv("BT3_NET_VOICE");
     return Port_NetActive() && v != NULL && strcmp(v, "alt") == 0;
+}
+
+/* The players' names (the lobby window's "Player name"), for the line under each side's gauges: this copy's own
+   goes out with its greeting (T_HELLO, the one who joins) or its answer and choices (T_HELLO_ACK, T_CONFIG, the
+   host), 20 bytes after the words those packets had. */
+
+/* The name of the player of side 0 or 1 in the match this copy is in ("" if it is not known). */
+const char *Port_NetName(int player) {
+    return Port_NetActive() && (player == 0 || player == 1) ? sNames[player] : "";
+}
+
+/* Whether this copy shows the two sides of the fight's HUD in each other's places: the player who joined is side 1,
+   and with this their own gauges are on the left, as the host's are for the host. Setting net_hud_own (on by
+   default); BT3_HUD_SWAP=1 the same without a connection, for looking at it. Only this copy's picture changes. */
+int Port_HudSwap(void) {
+    static int forced = -1, pref = -1;
+    extern int Port_Setting(const char *name, int def);
+    if (forced < 0) {
+        forced = getenv("BT3_HUD_SWAP") != NULL ? atoi(getenv("BT3_HUD_SWAP")) != 0 : 0;
+        pref = Port_Setting("net_hud_own", 1) != 0;
+    }
+    return forced || (pref && Port_NetActive() && sMe == 1);
 }
 
 /* Which player this copy plays in an online match (0 the host, 1 the one who joined). */
@@ -781,6 +832,7 @@ static void relaunch(int role, const char *join, int port) {
             SETENV("BT3_NET_JOIN", value);
         }
         SETENV("BT3_NET_SESSION", "1");
+        SETENV("BT3_NET_NAME", sMyName);
         if (role == 1) {
             snprintf(value, sizeof(value), "%u", (unsigned)sRules);
             SETENV("BT3_NET_RULES", value);

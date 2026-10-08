@@ -20,6 +20,11 @@ extern "C" {
 extern volatile int gPortNetMenuRequest;
 void Port_NetOptions(int rollback, int delay); // gs/net.c
 void Port_NetRulesSet(int type, int dp, int time); // gs/net.c: the host's battle type, DP limit row, time limit
+void Port_NetNameSet(const char *name);         // gs/net.c: this player's name for the match
+const char *Port_NetName(int player);          // the name of the player of side 0 or 1 ("" outside a match)
+int Port_HudSwap(void);                        // the two sides of the HUD are in each other's places on this copy
+int Port_NetActive(void);
+void *BtlChar_FindByObjId(int objId);          // the game: the fighter of a side, NULL outside a fight
 int Port_NetStats(int *out);                   // gs/net.c: the meter's numbers of an online match
 int Port_LobbyOther(void);
 extern unsigned gPortLiveBlanks;               // plat_stub.c: vertical blanks the game has gone through
@@ -401,6 +406,7 @@ static void build_net(void) {
                     } else {
                         Port_NetOptions(-1, -1); // joining: the host's choices arrive with its answer
                     }
+                    Port_NetNameSet(name);
                     Port_LobbyStart(tab == 0, address, atoi(port));
                 }
                 ImGui::EndDisabled();
@@ -940,9 +946,11 @@ static bool frame_build(void) {
     bool songOn = gUiSongReady != 0 && gUiSongIdx >= 0 && gUiSongIdx < PortSongs_Count(); // (the same for an added song)
     bool overlay = nameOn || songOn;
     bool meter = sReady && meter_on();
+    // the players' names under the gauges of an online fight
+    bool names = sReady && Port_NetActive() && BtlChar_FindByObjId(0) != NULL && (Port_NetName(0)[0] != '\0' || Port_NetName(1)[0] != '\0');
     meter_count();
     sBuilt = false;
-    if (!sReady || (!sOpen && !notice && !overlay && !meter)) {
+    if (!sReady || (!sOpen && !notice && !overlay && !meter && !names)) {
         return false;
     }
     sBuilt = true;
@@ -962,6 +970,31 @@ static bool frame_build(void) {
     }
     if (meter) {
         meter_draw();
+    }
+    if (names && gUiPresentW > 0 && gUiPresentH > 0) {
+        // Under each side's health bar (the game's 512 x 448 page: the bars end at about y 50). The left place is
+        // side 0's, or this player's own side when the HUD's sides are swapped.
+        ImDrawList *dl = ImGui::GetBackgroundDrawList();
+        float sx = (float)gUiPresentW / 512.0f, sy = (float)gUiPresentH / 448.0f;
+        float size = 15.0f * sy;
+        ImFont *font = ImGui::GetFont();
+        for (int place = 0; place < 2; place++) {
+            const char *text = Port_NetName(place ^ Port_HudSwap());
+            if (text[0] == '\0') {
+                continue;
+            }
+            ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
+            float x = place == 0 ? (float)gUiPresentX + 62.0f * sx : (float)gUiPresentX + (512.0f - 62.0f) * sx - ts.x;
+            float y = (float)gUiPresentY + 56.0f * sy;
+            for (int ox = -1; ox <= 1; ox++) {
+                for (int oy = -1; oy <= 1; oy++) {
+                    if (ox != 0 || oy != 0) {
+                        dl->AddText(font, size, ImVec2(x + (float)ox * 1.5f, y + (float)oy * 1.5f), IM_COL32(0, 0, 0, 220), text);
+                    }
+                }
+            }
+            dl->AddText(font, size, ImVec2(x, y), IM_COL32(255, 255, 255, 255), text);
+        }
     }
     if (notice) { // a line over the picture for a few seconds (the end of an online match)
         ImGuiIO &io = ImGui::GetIO();
