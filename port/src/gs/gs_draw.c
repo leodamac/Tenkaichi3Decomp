@@ -1284,6 +1284,8 @@ int GsGpu_Init(void) {
  * would jump far on screen (a camera cut, a teleport) is not blended, and when most are like that no in-between
  * picture is shown at all. */
 int gsInterp = -1;
+static float sInterpCamMove; /* GS pixels the camera alone moved the scenery in view this tick (the middle value) */
+static float sInterpRep[MAX_VU_UNIFORMS][3]; /* the first vertex of each block's mesh (model space) */
 /* The camera's change of this picture (interp_build): previous clip position = sInterpD * this clip position, for
    anything that stands still in the world; and the numbers that turn GS pixels into that clip space. */
 static float sInterpD[16], sInterpOffX, sInterpOffY, sInterpZMax;
@@ -1313,6 +1315,9 @@ static void interp_signatures(uint32_t *sig) {
         const GsDraw *d = &gsDraws[n];
         if (d->vu != 0 && d->uniform >= 0 && (uint32_t)d->uniform < gsVuUniCount) {
             uint32_t h = d->count * 2654435761u ^ (uint32_t)d->vu << 28; /* (not its texture or pipeline: a layer's texture can change every frame) */
+            if (sig[d->uniform] == 0 && d->count != 0 && gsVuIdx[d->first] < gsVuVertCount) {
+                memcpy(sInterpRep[d->uniform], &gsVuVerts[gsVuIdx[d->first] * 12], 3 * sizeof(float)); /* a point of the mesh */
+            }
             for (k = 0; k < 4 && k < d->count; k++) {
                 uint32_t v = gsVuIdx[d->first + k];
                 if (v < gsVuVertCount) {
@@ -1410,8 +1415,30 @@ static uint16_t sInterpChain[MAX_VU_UNIFORMS];
 static uint8_t sInterpUsed[MAX_VU_UNIFORMS];
 static int16_t sInterpPair[MAX_VU_UNIFORMS]; /* the previous picture's block each of this picture's was paired with, -1 none */
 
+/* A point of the block's mesh (model space) in clip space: screen matrix * bone * (point - pivot). (A real point of
+   the mesh, not the pivot or the origin: for scenery and for the sky's dome those can be beside or behind the eye,
+   where a position on the screen means nothing.) */
+static void interp_clip_pos(const Vu0Uniform *u, const float *v, float *s) {
+    float p[4], m[3];
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        m[i] = v[i] - u->pivotA[i];
+    }
+    for (i = 0; i < 4; i++) {
+        p[i] = u->boneA[i] * m[0] + u->boneA[4 + i] * m[1] + u->boneA[8 + i] * m[2] + u->boneA[12 + i];
+    }
+    for (i = 0; i < 4; i++) {
+        s[i] = u->screen[i] * p[0] + u->screen[4 + i] * p[1] + u->screen[8 + i] * p[2] + u->screen[12 + i];
+    }
+}
+
+#define INTERP_CUT 380.0f /* GS pixels the scenery may move in a tick by the camera alone; more is a cut */
+
 static int interp_build(float t, int first) {
     uint32_t i, paired = 0, jumped = 0;
+    float D[16], inv[16], chk[16];
+    int agreed = 0;
 
     if (gsVuUniCount == 0 || sInterpPrevCount == 0) {
         return 0;
@@ -1423,15 +1450,15 @@ static int interp_build(float t, int first) {
         sInterpChain[i] = sInterpBucket[b];
         sInterpBucket[b] = (uint16_t)i;
     }
+    /* 1. Each block's partner: the block of the previous picture that draws the same mesh. */
     for (i = 0; i < gsVuUniCount; i++) {
         const Vu0Uniform *c = &gsVuUni[i];
-        Vu0Uniform *o = &sInterpBlend[i];
         const float *cf = (const float *)c;
-        float xa, ya, xb, yb, bestDist = 0.0f, bestDist2 = 0.0f;
-        int sa, sb, k, best = -1;
+        float bestDist = 0.0f, bestDist2 = 0.0f;
+        int k, best = -1;
         uint16_t j;
 
-        *o = *c;
+        sInterpBlend[i] = *c;
         sInterpPair[i] = -1;
         if (sInterpSig[i] == 0) {
             continue;
@@ -1442,8 +1469,7 @@ static int interp_build(float t, int first) {
             if (sInterpPrevSig[j] == sInterpSig[i] && (!sInterpUsed[j] || sInterpSig[i] == 0x53484457u)) {
                 /* Nearest first by where the mesh stands (bones and pivots), and only among equals by the screen
                    matrix. One sum over both let the camera decide: the sky is the same slice of a dome many times
-                   over, and while the camera turned, the slice NEXT to a slice had the nearer screen matrix. A slice
-                   blended towards its neighbour leaves a streak (seen in 16:9, where more slices are on screen). */
+                   over, and while the camera turned, the slice NEXT to a slice had the nearer screen matrix. */
                 const float *pf = (const float *)&sInterpPrev[j];
                 float dist = 0.0f, dist2 = 0.0f;
                 for (k = 0; k < 40; k++) { /* bones, pivots */
@@ -1459,58 +1485,44 @@ static int interp_build(float t, int first) {
                 }
             }
         }
-        sInterpPair[i] = -1;
-        if (best < 0) {
-            continue;
-        }
-        sa = interp_screen_pos(&sInterpPrev[best], &xa, &ya);
-        sb = interp_screen_pos(c, &xb, &yb);
-        if (sa != sb || (sa != 0 && (fabsf(xa - xb) > 160.0f || fabsf(ya - yb) > 120.0f))) {
-            jumped++;
-            continue;
-        }
-        sInterpUsed[best] = 1;
-        sInterpPair[i] = best;
-        paired++;
-        {
-            const float *pf = (const float *)&sInterpPrev[best];
-            float *of = (float *)o;
-            /* boneA, boneB, pivotA, pivotB, screen, light: the first 60 floats; colours and misc stay picture n's */
-            for (k = 0; k < 60; k++) {
-                of[k] = pf[k] + (cf[k] - pf[k]) * t;
-            }
+        if (best >= 0) {
+            sInterpUsed[best] = 1;
+            sInterpPair[i] = (int16_t)best;
         }
     }
-    /* A block without a partner (a piece of scenery that came into view, a mesh whose strips changed) would stand
-       half a tick ahead of its blended neighbours: a seam. What moved for it is at least the camera: for an object
-       standing still, screen matrix = camera * model, so (previous screen) = D * (this screen) with one D for all
-       of them, D = previous * inverse(this) of any still object. D is taken from the first paired block whose
-       bones did not change and accepted if a second one agrees. */
+    /* 2. The camera's change. For an object standing still, screen matrix = camera * model, so (previous screen) =
+       D * (this screen) with one D for all of them: D = previous * inverse(this) of any still object (a pair whose
+       bones did not change). Taken from one such pair and accepted when another agrees; a few are tried. */
     {
-        float D[16], inv[16], chk[16];
-        int have = 0, agreed = 0;
+        int tries = 0;
+        uint32_t a, b;
 
-        for (i = 0; i < gsVuUniCount && !agreed; i++) {
-            const Vu0Uniform *c = &gsVuUni[i], *q;
-            if (sInterpPair[i] < 0) {
+        for (a = 0; a < gsVuUniCount && !agreed && tries < 8; a++) {
+            const Vu0Uniform *c = &gsVuUni[a], *q;
+            if (sInterpPair[a] < 0) {
                 continue;
             }
-            q = &sInterpPrev[sInterpPair[i]];
-            if (memcmp(c->boneA, q->boneA, 40 * sizeof(float)) != 0) { /* bones and pivots */
+            q = &sInterpPrev[sInterpPair[a]];
+            if (memcmp(c->boneA, q->boneA, 40 * sizeof(float)) != 0 || !interp_inverse(c->screen, inv)) {
                 continue;
             }
-            if (!have) {
-                if (interp_inverse(c->screen, inv)) {
-                    interp_mul(q->screen, inv, D);
-                    have = 1;
-                }
-            } else {
+            interp_mul(q->screen, inv, D);
+            tries++;
+            for (b = a + 1; b < gsVuUniCount; b++) {
+                const Vu0Uniform *c2 = &gsVuUni[b], *q2;
                 float err = 0.0f, mag = 0.0f;
                 int k;
-                interp_mul(D, c->screen, chk);
+                if (sInterpPair[b] < 0) {
+                    continue;
+                }
+                q2 = &sInterpPrev[sInterpPair[b]];
+                if (memcmp(c2->boneA, q2->boneA, 40 * sizeof(float)) != 0) {
+                    continue;
+                }
+                interp_mul(D, c2->screen, chk);
                 for (k = 0; k < 16; k++) {
-                    err += fabsf(chk[k] - q->screen[k]);
-                    mag += fabsf(q->screen[k]);
+                    err += fabsf(chk[k] - q2->screen[k]);
+                    mag += fabsf(q2->screen[k]);
                 }
                 if (err <= mag * 0.002f) {
                     agreed = 1;
@@ -1518,25 +1530,118 @@ static int interp_build(float t, int first) {
                     sInterpOffX = c->misc[0];
                     sInterpOffY = c->misc[1];
                     sInterpZMax = c->misc[2];
-                } else {
-                    break; /* the two do not share a camera move: no guess */
                 }
+                break; /* (one witness per candidate) */
             }
         }
         sInterpHaveD = agreed && sInterpZMax > 0.0f;
-        if (agreed) {
-            for (i = 0; i < gsVuUniCount; i++) {
-                if (sInterpPair[i] < 0 && sInterpSig[i] != 0) {
-                    const Vu0Uniform *c = &gsVuUni[i];
-                    Vu0Uniform *o = &sInterpBlend[i];
-                    int k;
-                    interp_mul(D, c->screen, chk);
-                    for (k = 0; k < 16; k++) {
-                        o->screen[k] = chk[k] + (c->screen[k] - chk[k]) * t;
-                    }
-                    gInterpCamera++;
-                }
+    }
+    /* 3. What moved too far to be the same thing a tick later. With the camera's change known, "far" is measured
+       after taking the camera out: where the block's pivot would have been if only the camera had moved, against
+       where its partner really was. (Measured on the screen as it is, a fast turn of the camera made everything
+       "jump": nothing was blended while spinning, which showed as hitches and as things out of step.) A camera that
+       itself moved the scenery by most of the screen is a cut: no in-between pictures for this tick. */
+    {
+        uint32_t still = 0, far = 0, nmove = 0;
+        static float move[256];
+        float cam = 0.0f;
+
+        /* how far the camera alone moved the scenery on the screen, typically: the middle of what the still blocks
+           in view moved */
+        for (i = 0; agreed && i < gsVuUniCount && nmove < 256; i++) {
+            const Vu0Uniform *c = &gsVuUni[i], *q;
+            float sc[4], sp[4];
+            if (sInterpPair[i] < 0) {
+                continue;
             }
+            q = &sInterpPrev[sInterpPair[i]];
+            if (memcmp(c->boneA, q->boneA, 40 * sizeof(float)) != 0) {
+                continue;
+            }
+            interp_clip_pos(c, sInterpRep[i], sc);
+            interp_clip_pos(q, sInterpRep[i], sp);
+            if (sc[3] > 1.0f && sp[3] > 1.0f && fabsf(sc[0] / sc[3]) < 4096.0f && fabsf(sc[1] / sc[3]) < 4096.0f) {
+                float dx = fabsf(sc[0] / sc[3] - sp[0] / sp[3]), dy = fabsf(sc[1] / sc[3] - sp[1] / sp[3]);
+                move[nmove++] = dx > dy ? dx : dy;
+            }
+        }
+        if (nmove != 0) {
+            uint32_t a2, b2;
+            for (a2 = 1; a2 < nmove; a2++) { /* (insertion sort: at most 256) */
+                float v = move[a2];
+                for (b2 = a2; b2 > 0 && move[b2 - 1] > v; b2--) { move[b2] = move[b2 - 1]; }
+                move[b2] = v;
+            }
+            cam = move[nmove / 2];
+        }
+        sInterpCamMove = cam;
+
+        for (i = 0; i < gsVuUniCount; i++) {
+            const Vu0Uniform *c = &gsVuUni[i], *q;
+            float sc[4], sp[4], pr[4];
+            int k, bad = 0;
+
+            if (sInterpPair[i] < 0) {
+                continue;
+            }
+            q = &sInterpPrev[sInterpPair[i]];
+            interp_clip_pos(c, sInterpRep[i], sc);
+            interp_clip_pos(q, sInterpRep[i], sp);
+            /* (The camera's change D cannot be applied to a fighter's position: the fighters are drawn through
+               another projection than the scenery, and D is in the scenery's. Tried: it put them far away.) What
+               moves on its own is judged on the screen as it is, with room for what the camera does to the picture:
+               a fighter the camera swings past moves as far as the scenery behind it. */
+            memcpy(pr, sc, sizeof(pr));
+            (void)k;
+            if (memcmp(c->boneA, q->boneA, 40 * sizeof(float)) == 0) {
+                /* It stands where it stood: it did not jump, whatever the numbers say (the origin of a piece of
+                   scenery can be anywhere, also beside or behind the eye, where a position on the screen is a
+                   quotient of two small numbers). Those in view tell how far the camera moved the scenery. */
+                if (agreed && sc[3] > 1.0f && sp[3] > 1.0f && fabsf(sc[0] / sc[3]) < 2048.0f && fabsf(sc[1] / sc[3]) < 2048.0f) {
+                    still++;
+                    far += fabsf(sc[0] / sc[3] - sp[0] / sp[3]) > INTERP_CUT || fabsf(sc[1] / sc[3] - sp[1] / sp[3]) > INTERP_CUT;
+                }
+            } else if (sp[3] > 1.0f && pr[3] > 1.0f && sc[3] > 1.0f && sInterpSig[i] != 0x53484457u) {
+                /* (a point behind the eye in either picture is not judged: what is there is not seen) */
+                bad = fabsf(sp[0] / sp[3] - pr[0] / pr[3]) > 160.0f + 1.5f * cam || fabsf(sp[1] / sp[3] - pr[1] / pr[3]) > 120.0f + 1.5f * cam;
+            }
+            if (bad && first && getenv("BT3_INTERP_JUMPS") != NULL && (int)gGsFrame == atoi(getenv("BT3_INTERP_JUMPS"))) {
+                fprintf(stderr, "jump block %u layer %.0f now %.0f,%.0f w %.1f; was %.0f,%.0f w %.1f; by the camera alone %.0f,%.0f w %.1f; pivot %.1f %.1f %.1f point %.1f %.1f %.1f\n", i, c->misc[3],
+                        sc[0] / sc[3], sc[1] / sc[3], sc[3], sp[0] / sp[3], sp[1] / sp[3], sp[3], pr[0] / pr[3], pr[1] / pr[3], pr[3], c->pivotA[0], c->pivotA[1], c->pivotA[2],
+                        sInterpRep[i][0], sInterpRep[i][1], sInterpRep[i][2]);
+            }
+            if (bad) {
+                sInterpPair[i] = -1;
+                jumped++;
+            }
+        }
+        if (still >= 4 && far * 2 > still) {
+            return 0; /* a cut */
+        }
+    }
+    /* 4. The blend. */
+    for (i = 0; i < gsVuUniCount; i++) {
+        const Vu0Uniform *c = &gsVuUni[i];
+        Vu0Uniform *o = &sInterpBlend[i];
+        int k;
+
+        if (sInterpPair[i] >= 0) {
+            const float *pf = (const float *)&sInterpPrev[sInterpPair[i]], *cf = (const float *)c;
+            float *of = (float *)o;
+            /* boneA, boneB, pivotA, pivotB, screen, light: the first 60 floats; colours and misc stay picture n's */
+            for (k = 0; k < 60; k++) {
+                of[k] = pf[k] + (cf[k] - pf[k]) * t;
+            }
+            paired++;
+        } else if (agreed && sInterpSig[i] != 0) {
+            /* No partner (a piece of scenery that came into view, a mesh whose strips changed, something that
+               jumped): it would stand ahead of its blended neighbours, a seam. What moved for it is at least the
+               camera. */
+            interp_mul(D, c->screen, chk);
+            for (k = 0; k < 16; k++) {
+                o->screen[k] = chk[k] + (c->screen[k] - chk[k]) * t;
+            }
+            gInterpCamera++;
         }
     }
     if (first && getenv("BT3_INTERP_FRAMES") != NULL) { /* testing: one line per picture */
@@ -1544,7 +1649,7 @@ static int interp_build(float t, int first) {
         extern unsigned gPortVBlanks;
         if (fp == NULL) { fp = fopen(getenv("BT3_INTERP_FRAMES"), "w"); }
         if (fp != NULL) {
-            fprintf(fp, "%u %u blocks %u paired %u jumped %u previous %u\n", gPortVBlanks, gGsFrame, gsVuUniCount, paired, jumped, sInterpPrevCount);
+            fprintf(fp, "%u %u blocks %u paired %u jumped %u previous %u camera %d\n", gPortVBlanks, gGsFrame, gsVuUniCount, paired, jumped, sInterpPrevCount, agreed);
         }
     }
     gInterpPaired += paired;
@@ -1620,7 +1725,7 @@ static int interp_piece_camera(const InterpPrim *c, float t) {
         }
     }
     for (k = 0; k < nv; k++) {
-        if (!interp_reproject(&cv[k], &x[k], &y[k], &z[k]) || fabsf(x[k] - cv[k].x) > 400.0f || fabsf(y[k] - cv[k].y) > 400.0f) {
+        if (!interp_reproject(&cv[k], &x[k], &y[k], &z[k]) || fabsf(x[k] - cv[k].x) > 40.0f + 3.0f * sInterpCamMove || fabsf(y[k] - cv[k].y) > 40.0f + 3.0f * sInterpCamMove) {
             return 0;
         }
     }
@@ -1718,7 +1823,7 @@ static void interp_build_verts(float t) {
             uint32_t at = r < n / 2 || n > m + r ? (r < m ? r : m - 1) : m - (n - r);
             uint32_t from = at > INTERP_WINDOW ? at - INTERP_WINDOW : 0, to = at + INTERP_WINDOW + 1 < m ? at + INTERP_WINDOW + 1 : m, j;
             int best = -1, k, sawFar = 0, sawUv = 0, nv = c->tris * 3;
-            float bestD = 0.0f;
+            float bestD = 0.0f, ex[INTERP_PIECE_MAX * 3], ey[INTERP_PIECE_MAX * 3];
 
             /* Big pieces and pieces cut off at the edge of the screen are scenery the game transforms itself (the
                sky's panels): cut differently every picture, so "the nearest like piece" is another panel or another
@@ -1738,6 +1843,14 @@ static void interp_build_verts(float t) {
                 }
             }
 
+            /* How far a partner may be: with room for what the camera does to the picture (while it turns fast,
+               everything is far on the screen, and nothing was blended). Not by taking the camera's change out of
+               each corner: effects that belong to a fighter are in the fighters' projection, which that change does
+               not fit. */
+            for (k = 0; k < nv; k++) {
+                ex[k] = cv[k].x;
+                ey[k] = cv[k].y;
+            }
             for (j = from; j < to; j++) {
                 const Vtx *pv;
                 float d = 0.0f, far = 0.0f;
@@ -1746,7 +1859,7 @@ static void interp_build_verts(float t) {
                 }
                 pv = &sInterpPrevVerts[sInterpPrevPrims[lo + j].first];
                 for (k = 0; k < nv; k++) {
-                    float dx = fabsf(pv[k].x - cv[k].x), dy = fabsf(pv[k].y - cv[k].y);
+                    float dx = fabsf(pv[k].x - ex[k]), dy = fabsf(pv[k].y - ey[k]);
                     d += dx + dy;
                     if (dx > far) { far = dx; }
                     if (dy > far) { far = dy; }
@@ -1754,7 +1867,7 @@ static void interp_build_verts(float t) {
                 /* 2D art moves only a little or not at all: the digits of a number that changes are the same few
                    glyphs in new places, and the nearest "same glyph" is a different digit of the old number (the
                    damage counter lost digits in the in-between pictures) */
-                if (far > (c->flat2d ? INTERP_FAR_2D : INTERP_FAR)) {
+                if (far > (c->flat2d ? INTERP_FAR_2D : INTERP_FAR + 1.5f * sInterpCamMove)) {
                     sawFar = 1;
                     continue;
                 }
@@ -1766,9 +1879,7 @@ static void interp_build_verts(float t) {
                 if (best < 0 || d < bestD) {
                     best = (int)j;
                     bestD = d;
-                    if (d == 0.0f) {
-                        break;
-                    }
+
                 }
             }
             if (best >= 0) {
@@ -1785,6 +1896,10 @@ static void interp_build_verts(float t) {
                     }
                     fprintf(stderr, "piece sig %08x tris %d flat %d rank %u/%u<-%u/%u now %.0f,%.0f..%.0f,%.0f before %.0f,%.0f..%.0f,%.0f d %.0f\n", c->sig, c->tris, c->flat2d,
                             r, end - i, (unsigned)best, pEnd - lo, x0, y0, x1, y1, px0, py0, px1, py1, bestD);
+                }
+                bestD = 0.0f;
+                for (k = 0; k < nv; k++) {
+                    bestD += fabsf(pv[k].x - cv[k].x) + fabsf(pv[k].y - cv[k].y);
                 }
                 if (bestD != 0.0f) {
                     for (k = 0; k < nv; k++) {
@@ -1939,6 +2054,9 @@ void GsGpu_InterpPump(int ahead_ms, int all) {
         }
         if (sInterpNext == sInterpSteps && getenv("BT3_INTERP_ONLY") != NULL) {
             sInterpNext = 0; /* testing: only in-between pictures are shown (so a screenshot holds one) */
+            interp_counts_restore();
+            interp_remember();
+            gsVertCount = gsVuVertCount = gsVuIdxCount = gsVuUniCount = gsDrawCount = 0;
             return;
         }
         interp_counts_restore();
