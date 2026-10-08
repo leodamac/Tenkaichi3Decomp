@@ -7,8 +7,8 @@
  *      joins: "join room <code>");
  *   3. ends with the other player's addresses, which the lobby sends its greetings to (both sides at once: that is
  *      what lets the two routers pass each other's packets).
- * The Worker is spoken to over HTTPS by starting the system's `curl` (Windows 10 and later, and nearly every Linux,
- * have one): the port has no HTTPS of its own. No game data goes that way.
+ * The Worker is spoken to over HTTPS with what the system has: WinHTTP on Windows, the curl library on Linux, and
+ * failing those the `curl` program (BT3_MATCH_CURL=1 asks for the program). No game data goes that way.
  *
  * BT3_MATCH_URL=<address> names another Worker (one's own; see port/matchmaking/README.md).
  */
@@ -62,7 +62,113 @@ static void set_state(int state, const char *error) {
 
 /* ---- the Worker, through curl ---- */
 
-/* POSTs `json` to <url>/v1/<what>; the answer's text in out. 0 = curl could not be run or gave nothing. */
+#ifdef _WIN32
+/* Windows: its own HTTPS (WinHTTP), so nothing has to be installed and no other program is started. */
+#include <winhttp.h>
+
+static int http_post_native(const char *url, const char *json, char *out, size_t size) {
+    wchar_t wurl[512], host[256], path[256];
+    URL_COMPONENTS uc;
+    HINTERNET ses = NULL, con = NULL, req = NULL;
+    DWORD got = 0, used = 0, status = 0, len = sizeof(status);
+    int ok = 0;
+
+    if (MultiByteToWideChar(CP_UTF8, 0, url, -1, wurl, 512) == 0) {
+        return 0;
+    }
+    memset(&uc, 0, sizeof(uc));
+    uc.dwStructSize = sizeof(uc);
+    uc.lpszHostName = host;
+    uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = path;
+    uc.dwUrlPathLength = 256;
+    if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) {
+        return 0;
+    }
+    ses = WinHttpOpen(L"Tenkaichi3Decomp", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (ses != NULL) {
+        WinHttpSetTimeouts(ses, 8000, 8000, 8000, 12000);
+        con = WinHttpConnect(ses, host, uc.nPort, 0);
+    }
+    if (con != NULL) {
+        req = WinHttpOpenRequest(con, L"POST", path, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+    }
+    if (req != NULL && WinHttpSendRequest(req, L"Content-Type: application/json\r\n", (DWORD)-1, (LPVOID)json, (DWORD)strlen(json), (DWORD)strlen(json), 0) &&
+        WinHttpReceiveResponse(req, NULL)) {
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &len, WINHTTP_NO_HEADER_INDEX);
+        while (used + 1 < size && WinHttpReadData(req, out + used, (DWORD)(size - 1 - used), &got) && got != 0) {
+            used += got;
+        }
+        out[used] = '\0';
+        ok = used > 0;
+    }
+    if (req != NULL) { WinHttpCloseHandle(req); }
+    if (con != NULL) { WinHttpCloseHandle(con); }
+    if (ses != NULL) { WinHttpCloseHandle(ses); }
+    return ok;
+}
+#else
+/* Linux: the system's curl library, if it is there (it nearly always is), loaded when first needed. */
+static int http_post_native(const char *url, const char *json, char *out, size_t size) {
+    typedef void *(*init_fn)(void);
+    typedef int (*setopt_fn)(void *, int, ...);
+    typedef int (*perform_fn)(void *);
+    typedef void (*cleanup_fn)(void *);
+    static SDL_SharedObject *lib;
+    static int tried;
+    static init_fn init;
+    static setopt_fn setopt;
+    static perform_fn perform;
+    static cleanup_fn cleanup;
+    void *h;
+    SDL_IOStream *mem;
+    FILE *fp;
+    int rc;
+    long n;
+
+    if (!tried) {
+        static const char *const names[] = {"libcurl.so.4", "libcurl-gnutls.so.4", "libcurl.so"};
+        size_t i;
+        tried = 1;
+        for (i = 0; lib == NULL && i < sizeof(names) / sizeof(names[0]); i++) {
+            lib = SDL_LoadObject(names[i]);
+        }
+        if (lib != NULL) {
+            init = (init_fn)SDL_LoadFunction(lib, "curl_easy_init");
+            setopt = (setopt_fn)SDL_LoadFunction(lib, "curl_easy_setopt");
+            perform = (perform_fn)SDL_LoadFunction(lib, "curl_easy_perform");
+            cleanup = (cleanup_fn)SDL_LoadFunction(lib, "curl_easy_cleanup");
+        }
+    }
+    (void)mem;
+    if (init == NULL || setopt == NULL || perform == NULL || cleanup == NULL || (h = init()) == NULL) {
+        return 0;
+    }
+    fp = tmpfile(); /* (the library writes the answer with fwrite by default: into a file that is never on disk by name) */
+    if (fp == NULL) {
+        cleanup(h);
+        return 0;
+    }
+    setopt(h, 10002 /* CURLOPT_URL */, url);
+    setopt(h, 10015 /* CURLOPT_POSTFIELDS */, json);
+    setopt(h, 10001 /* CURLOPT_WRITEDATA */, fp);
+    setopt(h, 13 /* CURLOPT_TIMEOUT */, 12L);
+    setopt(h, 99 /* CURLOPT_NOSIGNAL */, 1L);
+    rc = perform(h);
+    cleanup(h);
+    n = 0;
+    if (rc == 0) {
+        rewind(fp);
+        n = (long)fread(out, 1, size - 1, fp);
+        out[n > 0 ? n : 0] = '\0';
+    }
+    fclose(fp);
+    return rc == 0 && n > 0;
+}
+#endif
+
+/* POSTs `json` to <url>/v1/<what>; the answer's text in out. 0 = no answer. The system's own HTTPS first (above); if
+   that is not to be had, the `curl` program. */
 static int http_post(const char *what, const char *json, char *out, size_t size) {
     char url[256];
     const char *args[12];
@@ -72,6 +178,9 @@ static int http_post(const char *what, const char *json, char *out, size_t size)
     void *data;
 
     SDL_snprintf(url, sizeof(url), "%s/v1/%s", match_url(), what);
+    if (SDL_getenv("BT3_MATCH_CURL") == NULL && http_post_native(url, json, out, size)) {
+        return 1;
+    }
 #ifdef _WIN32
     args[n++] = "curl.exe";
 #else
@@ -268,7 +377,7 @@ static int SDLCALL match_thread(void *arg) {
     if (sM.role == 1) {
         SDL_snprintf(body, sizeof(body), "{\"v\":%d,\"name\":\"%s\",\"addrs\":[%s]}", sM.version, name, addrs);
         if (!http_post("host", body, answer, sizeof(answer))) {
-            set_state(-1, "The matchmaking service could not be reached (is curl installed? is the network up?).");
+            set_state(-1, "The matchmaking service could not be reached (is the network up?).");
             return 0;
         }
         if (STOPPED()) {
@@ -305,6 +414,7 @@ static int SDLCALL match_thread(void *arg) {
                     sM.st.peerCount = st.peerCount;
                     sM.st.state = 3;
                     SDL_UnlockMutex(sM.lock);
+                    http_post("leave", body, answer, sizeof(answer)); /* the room has done its work: it is given up at once */
                     return 0;
                 }
                 if (SDL_strstr(answer, "no room") != NULL) {
@@ -321,7 +431,7 @@ static int SDLCALL match_thread(void *arg) {
         MatchStatus st;
         SDL_snprintf(body, sizeof(body), "{\"v\":%d,\"code\":\"%s\",\"name\":\"%s\",\"addrs\":[%s]}", sM.version, sM.code, name, addrs);
         if (!http_post("join", body, answer, sizeof(answer))) {
-            set_state(-1, "The matchmaking service could not be reached (is curl installed? is the network up?).");
+            set_state(-1, "The matchmaking service could not be reached (is the network up?).");
             return 0;
         }
         (void)you;
