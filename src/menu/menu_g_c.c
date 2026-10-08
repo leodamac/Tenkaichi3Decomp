@@ -3,10 +3,6 @@
 #include "sys/pad.h"
 #include "sys/save.h"
 
-#ifdef PORT
-extern int Port_NetSession(void); /* port/src/gs/net.c */
-#endif
-
 DuelMenu *gDuelMenu = NULL; /* 0x3B38E8 */
 
 /*
@@ -605,12 +601,6 @@ void DuelMenu_Input(s32 *result) {
             Snd_PlaySe(1, 0);
         } else if (gPad[0].gamePressed & PADG_CROSS) {
             DM->idle = 0;
-#ifdef PORT /* PC build: an online session is 1P vs 2P; the other two cannot be chosen in it */
-            if (Port_NetSession() && (DM_CUR == 0 || DM_CUR == 2)) {
-                Snd_PlaySe(1, 7);
-                break;
-            }
-#endif
             switch (DM_CUR) {
             case 3: {
                 char name[64];
