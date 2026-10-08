@@ -1308,6 +1308,7 @@ static unsigned gInterpTicks;
 static uint64_t sInterpBlendShown, sInterpBlendTook; /* when the in-between picture was handed to the screen; how long replaying its list took */
 static struct { uint32_t verts, vuVerts, vuIdx, vuUni, draws; int anchor; unsigned skipped, native; unsigned tdraws[MAX_TARGETS]; } sInterpSaved;
 unsigned gInterpShown, gInterpSkipped; /* in-between pictures shown / left out since the start */
+static unsigned gInterpCuts, gInterpStatic;
 static unsigned gInterpFollowed, gInterpThrough; /* ticks left without in-between pictures because the camera's way crossed the scenery */
 static unsigned gInterpPaired, gInterpUnpaired, gInterpCamera; /* blocks blended / without a partner / of those, moved by the camera's change (BT3_INTERP_LOG) */
 
@@ -1590,7 +1591,7 @@ static void interp_bone(const float *p, const float *c, float t, int around, flo
     }
 }
 
-#define INTERP_CUT 380.0f /* GS pixels the scenery may move in a tick by the camera alone; more is a cut */
+#define INTERP_CUT 300.0f /* GS pixels the scenery may move in a tick by the camera alone; more is a cut */
 
 static int interp_build(float t, int first) {
     uint32_t i, paired = 0;
@@ -1860,7 +1861,7 @@ static int interp_build(float t, int first) {
        "jump": nothing was blended while spinning, which showed as hitches and as things out of step.) A camera that
        itself moved the scenery by most of the screen is a cut: no in-between pictures for this tick. */
     {
-        uint32_t still = 0, far = 0, nmove = 0;
+        uint32_t still = 0, far = 0, nmove = 0, movN = 0, movBig = 0;
         static float move[256];
         float cam = 0.0f;
 
@@ -1881,6 +1882,55 @@ static int interp_build(float t, int first) {
             if (sc[3] > 1.0f && sp[3] > 1.0f && fabsf(sc[0] / sc[3]) < 4096.0f && fabsf(sc[1] / sc[3]) < 4096.0f) {
                 float dx = fabsf(sc[0] / sc[3] - sp[0] / sp[3]), dy = fabsf(sc[1] / sc[3] - sp[1] / sp[3]);
                 move[nmove++] = dx > dy ? dx : dy;
+            }
+        }
+        /* The same from the scenery's own vertices: a few hundred of them, those in view now, and where the camera's
+           change says they were. (The first vertex of each piece, as above, is seldom in view: with nothing to go
+           by, the fighters were asked whether a tick is a cut, and one that dashed past the camera said yes.) */
+        if (agreed) {
+            uint32_t n2, total = 0, stepV;
+            for (n2 = 0; n2 < gsDrawCount; n2++) {
+                total += gsDraws[n2].vu == 2 ? gsDraws[n2].count : 0;
+            }
+            stepV = total / 400 ? total / 400 : 1;
+            nmove = 0;
+            for (n2 = 0; n2 < gsDrawCount; n2++) {
+                const GsDraw *d = &gsDraws[n2];
+                const Vu0Uniform *c;
+                uint32_t k2;
+                if (d->vu != 2 || d->uniform < 0 || (uint32_t)d->uniform >= gsVuUniCount) {
+                    continue;
+                }
+                c = &gsVuUni[d->uniform];
+                for (k2 = (n2 * 7) % stepV; k2 < d->count; k2 += stepV) {
+                    const float *v = &gsVuVerts[gsVuIdx[d->first + k2] * 12];
+                    float sc[4], sp[4], x, y;
+                    int k3;
+                    for (k3 = 0; k3 < 4; k3++) {
+                        sc[k3] = c->screen[k3] * v[0] + c->screen[4 + k3] * v[1] + c->screen[8 + k3] * v[2] + c->screen[12 + k3];
+                    }
+                    if (!(sc[3] > 1.0f)) {
+                        continue;
+                    }
+                    x = sc[0] / sc[3] - c->misc[0];
+                    y = sc[1] / sc[3] - c->misc[1];
+                    if (x < 0.0f || x > 640.0f || y < 0.0f || y > 448.0f) {
+                        continue;
+                    }
+                    for (k3 = 0; k3 < 4; k3++) {
+                        sp[k3] = D[k3] * sc[0] + D[4 + k3] * sc[1] + D[8 + k3] * sc[2] + D[12 + k3] * sc[3];
+                    }
+                    still++;
+                    if (!(sp[3] > 1.0f)) {
+                        far++;
+                    } else {
+                        float dx = fabsf(sc[0] / sc[3] - sp[0] / sp[3]), dy = fabsf(sc[1] / sc[3] - sp[1] / sp[3]);
+                        far += dx > INTERP_CUT || dy > INTERP_CUT;
+                        if (nmove < 256) {
+                            move[nmove++] = dx > dy ? dx : dy;
+                        }
+                    }
+                }
             }
         }
         if (nmove != 0) {
@@ -1914,11 +1964,15 @@ static int interp_build(float t, int first) {
             if (memcmp(c->boneA, q->boneA, 40 * sizeof(float)) == 0) {
                 /* It stands where it stood: it did not jump, whatever the numbers say (the origin of a piece of
                    scenery can be anywhere, also beside or behind the eye, where a position on the screen is a
-                   quotient of two small numbers). Those in view tell how far the camera moved the scenery. */
-                if (agreed && sc[3] > 1.0f && sp[3] > 1.0f && fabsf(sc[0] / sc[3]) < 2048.0f && fabsf(sc[1] / sc[3]) < 2048.0f) {
-                    still++;
-                    far += fabsf(sc[0] / sc[3] - sp[0] / sp[3]) > INTERP_CUT || fabsf(sc[1] / sc[3] - sp[1] / sp[3]) > INTERP_CUT;
-                }
+                   quotient of two small numbers). Those in view now tell how far the camera moved the scenery: one
+                   that was behind the eye a tick ago, or most of a screen away, speaks for a cut. */
+
+            } else if (sInterpSig[i] != 0x53484457u && c->misc[3] <= 1.0f && sc[3] > 1.0f) {
+                /* a part of a fighter: did it go far, or to quite another distance? */
+                movN++;
+                movBig += !(sp[3] > 1.0f) || fabsf(sc[0] / sc[3] - sp[0] / sp[3]) > 160.0f || fabsf(sc[1] / sc[3] - sp[1] / sp[3]) > 120.0f || sc[3] > sp[3] * 1.7f || sp[3] > sc[3] * 1.7f;
+            }
+            if (memcmp(c->boneA, q->boneA, 40 * sizeof(float)) == 0) {
             } else if (sp[3] > 1.0f && pr[3] > 1.0f && sc[3] > 1.0f && sInterpSig[i] != 0x53484457u) {
                 /* (a point behind the eye in either picture is not judged: what is there is not seen) */
                 /* Most of the screen in one tick. (It was a third of it: a fighter close to the camera that dashes
@@ -1937,8 +1991,21 @@ static int interp_build(float t, int first) {
                 jumped++;
             }
         }
-        if (still >= 4 && far * 2 > still) {
-            return 0; /* a cut */
+        /* A cut: the scenery in view says so; where there is none to ask (a transformation's or an ultimate's own
+           scenes before a backdrop), the fighters do. (With scenery in view the fighters are not asked: one that
+           dashes past the camera goes far and to another distance in one tick, and that is no cut.) */
+        if (getenv("BT3_INTERP_CUTLOG") != NULL) {
+            fprintf(stderr, "cut? frame %u: agreed %d, still in view %u, far %u, camera move %.0f; fighter parts %u, big %u; blocks %u, paired %u\n", gGsFrame, agreed, still, far, cam, movN, movBig, gsVuUniCount,
+                    (unsigned)0);
+        }
+        /* (also: the scenery as a whole went by more than a third of the screen, which no turn of the camera does
+           in a thirtieth of a second, the pieces in view or not; and nearly every part of the fighters went far
+           while the scenery is no witness or moved a good deal too: the shots of a transformation or an ultimate
+           with a little scenery in a corner) */
+        if ((still >= 8 ? far * 2 > still || cam > 250.0f : movN >= 6 && movBig * 2 > movN) ||
+            (movN >= 6 && movBig * 10 >= movN * 9 && cam > 120.0f)) {
+            gInterpCuts++;
+            return 0;
         }
     }
     /* Do the bones of what moves hold places as seen from the camera (the fighters' do: their screen matrix is the
@@ -2293,6 +2360,7 @@ static int interp_reproject(const Vtx *v, float *x, float *y, float *z) {
     return interp_reproject_with(sInterpD, v, x, y, z);
 }
 
+static int sInterpTrust; /* the piece is of a kind known to stand still in the world: no further questions */
 /* Moves a piece by the camera's change. 0 = not possible (it keeps this picture's place). */
 static int interp_piece_camera(const InterpPrim *c, float t) {
     const Vtx *cv = &gsVerts[c->first];
@@ -2300,7 +2368,7 @@ static int interp_piece_camera(const InterpPrim *c, float t) {
     float x[INTERP_PIECE_MAX * 3], y[INTERP_PIECE_MAX * 3], z[INTERP_PIECE_MAX * 3];
     int k, nv = c->tris * 3;
 
-    {   /* Not what faces the screen flat (every corner at the same depth: a banner, a flash, a sprite of the HUD
+    if (!sInterpTrust) {   /* Not what faces the screen flat (every corner at the same depth: a banner, a flash, a sprite of the HUD
            drawn with perspective numbers): that is laid onto the screen, not standing in the world. (The "Fight!"
            banner slid down with the camera.) */
         float q0 = cv[0].q, q1 = q0;
@@ -2317,7 +2385,7 @@ static int interp_piece_camera(const InterpPrim *c, float t) {
             return 0;
         }
     }
-    {
+    if (!sInterpTrust) {
         /* Is that where such a thing was? The camera's change is in the scenery's projection; a piece drawn through
            another one (what belongs to a fighter: its dust, its aura, the dark sheet of a close-up) comes out
            anywhere, also over the whole screen (seen: a grey veil over one in-between picture). So the previous
@@ -2433,6 +2501,7 @@ static uint32_t interp_prims(InterpPrim *out) {
 
 static void interp_build_verts(float t) {
     uint32_t i, lo = 0;
+    int staticKind = 0;
 
     memcpy(sInterpBlendVerts, gsVerts, gsVertCount * sizeof(Vtx));
     memset(sInterpPrimUsed, 0, sInterpPrevPrimCount);
@@ -2444,6 +2513,56 @@ static void interp_build_verts(float t) {
         pEnd = lo;
         while (pEnd < sInterpPrevPrimCount && sInterpPrevPrims[pEnd].sig == sig) { pEnd++; }
         gInterpTris += end - i;
+        /* Is this kind of piece something that stands still in the world (the translucent wall at the edge of the
+           map, drawn as a grid of like tiles; marks on the ground)? Then every piece of it goes by the camera's
+           change, exactly. (Paired by nearness, a tile of the wall found its neighbour, and as the tiles shown
+           change with where the fighters are, parts of the wall stood a tile off in the in-between pictures: a break
+           across it that came and went.) It is known by this: taken back by the camera's change, the pieces land
+           on pieces of the previous picture, corner for corner. Only asked while the camera moves: when it stands,
+           everything would pass. */
+        staticKind = 0;
+        if (pEnd > lo && !sInterpPrims[i].flat2d && sInterpHaveD && sInterpCamMove > 3.0f) {
+            uint32_t stepS = (end - i) / 24 ? (end - i) / 24 : 1, tested = 0, okS = 0, rs, j;
+            for (rs = 0; rs < end - i; rs += stepS) {
+                const InterpPrim *c = &sInterpPrims[i + rs];
+                const Vtx *cv = &gsVerts[c->first];
+                float px[INTERP_PIECE_MAX * 3], py[INTERP_PIECE_MAX * 3], pz;
+                int k, nv = c->tris * 3, can = 1, found = 0;
+                for (k = 0; k < nv && can; k++) {
+                    can = interp_reproject(&cv[k], &px[k], &py[k], &pz);
+                }
+                if (!can) {
+                    continue;
+                }
+                tested++;
+                for (j = lo; j < pEnd && !found; j++) {
+                    const Vtx *pv = &sInterpPrevVerts[sInterpPrevPrims[j].first];
+                    for (k = 0; k < nv; k++) {
+                        if (fabsf(pv[k].x - px[k]) > 1.5f || fabsf(pv[k].y - py[k]) > 1.5f) {
+                            break;
+                        }
+                    }
+                    found = k == nv;
+                }
+                okS += found;
+            }
+            /* (half of them is enough: the tiles of the wall that are shown change from picture to picture, and
+               the new ones have nothing to land on) */
+            staticKind = okS >= 1 && okS * 2 >= tested;
+            if (getenv("BT3_INTERP_DUMP") != NULL && (int)gGsFrame == atoi(getenv("BT3_INTERP_DUMP"))) {
+                const InterpPrim *c = &sInterpPrims[i];
+                const Vtx *cv = &gsVerts[c->first];
+                float bx = 0.0f, by = 0.0f, bz = 0.0f, bd = 1e9f;
+                int can = interp_reproject(&cv[0], &bx, &by, &bz);
+                for (j = lo; j < pEnd; j++) {
+                    const Vtx *pv = &sInterpPrevVerts[sInterpPrevPrims[j].first];
+                    float dd = fabsf(pv[0].x - bx) + fabsf(pv[0].y - by);
+                    if (dd < bd) { bd = dd; }
+                }
+                fprintf(stderr, "kind %08x tris %d: %u now, %u before; tested %u, landed %u; first corner %.1f,%.1f q %.5f -> by the camera %.1f,%.1f (%d), nearest first corner before %.1f away\n", c->kind, c->tris, end - i, pEnd - lo, tested, okS,
+                        cv[0].x, cv[0].y, cv[0].q, bx, by, can, bd);
+            }
+        }
         if (pEnd == lo) {
             gInterpWhy[0] += end - i;
             for (r = 0; sInterpHaveD && r < end - i; r++) {
@@ -2462,6 +2581,16 @@ static void interp_build_verts(float t) {
             int best = -1, k, sawFar = 0, sawUv = 0, nv = c->tris * 3, big = 0;
             float bestD = 0.0f, ex[INTERP_PIECE_MAX * 3], ey[INTERP_PIECE_MAX * 3];
 
+            if (staticKind) {
+                sInterpTrust = 1;
+                if (interp_piece_camera(c, t)) {
+                    gInterpTrisCamera++;
+                    gInterpStatic++;
+                }
+                sInterpTrust = 0;
+                continue;
+            }
+
             /* Big pieces and pieces cut off at the edge of the screen are scenery the game transforms itself (the
                sky's panels): cut differently every picture, so "the nearest like piece" is another panel or another
                cut of it, and panels blended towards different partners leave streaks between them. They stand still
@@ -2473,7 +2602,11 @@ static void interp_build_verts(float t) {
                     if (cv[k].y < y0) { y0 = cv[k].y; } if (cv[k].y > y1) { y1 = cv[k].y; }
                 }
                 if (x0 < -8.0f || y0 < -8.0f || x1 > 520.0f || y1 > 456.0f || (x1 - x0) * (y1 - y0) > 6000.0f) {
-                    if (interp_piece_camera(c, t)) {
+                    int okc = interp_piece_camera(c, t);
+                    if (getenv("BT3_INTERP_DUMP") != NULL && (int)gGsFrame == atoi(getenv("BT3_INTERP_DUMP"))) {
+                        fprintf(stderr, "big piece kind %08x tris %d at %.0f,%.0f..%.0f,%.0f q %.5f..%.5f: by the camera %d\n", c->kind, c->tris, x0, y0, x1, y1, cv[0].q, cv[nv - 1].q, okc);
+                    }
+                    if (okc) {
                         gInterpTrisCamera++;
                         continue;
                     }
@@ -2800,8 +2933,9 @@ void GsGpu_FrameEnd(void) {
                 fprintf(stderr, "interp:   of those without a partner, %u moved with the camera\n", gInterpCamera);
                 fprintf(stderr, "interp:   effects and 2D: %u triangles, %u moved, %u still; not paired: %u new kind, %u too far, %u other texture piece, %u none free\n",
                         gInterpTris, gInterpTrisBlended, gInterpWhy[3], gInterpWhy[0], gInterpWhy[1], gInterpWhy[2], gInterpWhy[4]);
-                fprintf(stderr, "interp:   pieces moved by the camera's change: %u\n", gInterpTrisCamera);
-                fprintf(stderr, "interp:   ticks where the camera's way went through the scenery: %u\n", gInterpThrough);
+                fprintf(stderr, "interp:   pieces moved by the camera's change: %u, of them of kinds that stand still: %u\n", gInterpTrisCamera, gInterpStatic);
+                gInterpStatic = 0;
+                fprintf(stderr, "interp:   ticks where the camera's way went through the scenery: %u; cuts: %u\n", gInterpThrough, gInterpCuts);
                 gInterpTrisCamera = 0;
                 memset(gInterpWhy, 0, sizeof(gInterpWhy));
                 gInterpPaired = gInterpUnpaired = gInterpCamera = gInterpTris = gInterpTrisBlended = 0;
