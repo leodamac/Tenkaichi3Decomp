@@ -1291,7 +1291,11 @@ static int sInterpHaveD;
 static Vu0Uniform *sInterpPrev, *sInterpBlend;
 static uint32_t *sInterpPrevSig, *sInterpSig;
 static uint32_t sInterpPrevCount;
-static int sInterpPending;
+static int sInterpNext;  /* the tick's next picture still to be shown (2..sInterpSteps), 0 = none */
+static int sInterpSteps = 2;
+static unsigned sInterpLastBlank;
+static uint64_t sInterpTickNs = 33366700ull; /* how long the tick being shown lasts */
+static unsigned gInterpTicks;
 static uint64_t sInterpBlendShown, sInterpBlendTook; /* when the in-between picture was handed to the screen; how long replaying its list took */
 static struct { uint32_t verts, vuVerts, vuIdx, vuUni, draws; int anchor; unsigned skipped, native; unsigned tdraws[MAX_TARGETS]; } sInterpSaved;
 unsigned gInterpShown, gInterpSkipped; /* in-between pictures shown / left out since the start */
@@ -1402,13 +1406,12 @@ static int interp_inverse(const float *m, float *o) {
    Each block of this picture is paired with the block of the previous picture that draws the same mesh; of several
    that do (a piece of scenery used more than once) the one whose matrices are nearest. */
 static uint16_t sInterpBucket[4096];
-static uint16_t sInterpNext[MAX_VU_UNIFORMS];
+static uint16_t sInterpChain[MAX_VU_UNIFORMS];
 static uint8_t sInterpUsed[MAX_VU_UNIFORMS];
 static int16_t sInterpPair[MAX_VU_UNIFORMS]; /* the previous picture's block each of this picture's was paired with, -1 none */
 
-static int interp_build(void) {
+static int interp_build(float t, int first) {
     uint32_t i, paired = 0, jumped = 0;
-    const float t = getenv("BT3_INTERP_T") != NULL ? (float)atof(getenv("BT3_INTERP_T")) : 0.5f; /* (testing: 1 = picture n itself) */
 
     if (gsVuUniCount == 0 || sInterpPrevCount == 0) {
         return 0;
@@ -1417,7 +1420,7 @@ static int interp_build(void) {
     memset(sInterpUsed, 0, sInterpPrevCount);
     for (i = sInterpPrevCount; i-- > 0;) { /* (backwards: each chain lists its blocks in the order of the list) */
         uint32_t b = sInterpPrevSig[i] * 2654435761u >> 20;
-        sInterpNext[i] = sInterpBucket[b];
+        sInterpChain[i] = sInterpBucket[b];
         sInterpBucket[b] = (uint16_t)i;
     }
     for (i = 0; i < gsVuUniCount; i++) {
@@ -1433,7 +1436,7 @@ static int interp_build(void) {
         if (sInterpSig[i] == 0) {
             continue;
         }
-        for (j = sInterpBucket[sInterpSig[i] * 2654435761u >> 20]; j != 0xFFFF; j = sInterpNext[j]) {
+        for (j = sInterpBucket[sInterpSig[i] * 2654435761u >> 20]; j != 0xFFFF; j = sInterpChain[j]) {
             /* (a shadow's strips are several blocks with one fighter's matrices, and their number changes with
                the ground: each takes the nearest of the previous picture, used before or not) */
             if (sInterpPrevSig[j] == sInterpSig[i] && (!sInterpUsed[j] || sInterpSig[i] == 0x53484457u)) {
@@ -1536,7 +1539,7 @@ static int interp_build(void) {
             }
         }
     }
-    if (getenv("BT3_INTERP_FRAMES") != NULL) { /* testing: one line per picture */
+    if (first && getenv("BT3_INTERP_FRAMES") != NULL) { /* testing: one line per picture */
         static FILE *fp;
         extern unsigned gPortVBlanks;
         if (fp == NULL) { fp = fopen(getenv("BT3_INTERP_FRAMES"), "w"); }
@@ -1838,26 +1841,15 @@ static void interp_present_log(char kind) {
     }
 }
 
-/* The real picture n, one vertical blank after its in-between picture (Port_VBlank). */
-void GsGpu_InterpFlush(void) {
+/* How many pictures a tick is shown as: 1 = the game's own (30 a second), 2 = one in-between picture (60), 4 = three
+   (120), 8 = seven (240). The setting "interp" is 0..3. */
+static int interp_steps(void) {
+    return gsInterp <= 0 ? 1 : gsInterp == 1 ? 2 : gsInterp == 2 ? 4 : 8;
+}
+
+static void interp_counts_restore(void) {
     int i;
 
-    if (!sInterpPending || sBackend == NULL) {
-        return;
-    }
-    sInterpPending = 0;
-    if (gsInterp == 2) {
-        return; /* testing: only the in-between pictures are shown (so a screenshot holds one) */
-    }
-    if (gsDrawCount != 0 || gsVertCount != 0 || gsVuUniCount != 0) {
-        /* the game drew before the blank: its new draws would be mixed into the kept list. Not expected. */
-        static int said;
-        if (!said) {
-            said = 1;
-            fprintf(stderr, "bt3: interp: draws recorded before the picture was shown; that picture is dropped\n");
-        }
-        return;
-    }
     gsVertCount = sInterpSaved.verts;
     gsVuVertCount = sInterpSaved.vuVerts;
     gsVuIdxCount = sInterpSaved.vuIdx;
@@ -1869,19 +1861,97 @@ void GsGpu_InterpFlush(void) {
     for (i = 0; i < gsTargetCount && i < MAX_TARGETS; i++) {
         gsTargets[i].draws = sInterpSaved.tdraws[i];
     }
-    /* Half a tick after the in-between picture, not "at the vertical blank": the in-between picture is shown when
-       the game has finished computing the tick, a millisecond or two after a blank, so the real one at the next
-       blank came 15 ms after it and the next in-between picture 18 ms after that (measured). Waiting out the
-       difference makes them even; it is the time the game took for the tick. */
-    if (getenv("BT3_UNCAPPED") == NULL) {
-        uint64_t due = sInterpBlendShown + 16683350ull - sInterpBlendTook, now = gpu_now(); /* (replaying the list takes the same time again) */
-        if (now < due && due - now < 8000000ull) {
-            SDL_DelayPrecise(due - now);
+}
+
+/* Shows picture `step` of the tick's sInterpSteps: the list replayed `step / steps` of the way from the previous
+   tick; the last one is the tick itself. The recorded list has to be in place (interp_counts_restore). */
+static void interp_show(int step) {
+    if (step < sInterpSteps) {
+        Vu0Uniform *real = gsVuUni;
+        Vtx *realVerts = gsVerts;
+        float t = getenv("BT3_INTERP_T") != NULL ? (float)atof(getenv("BT3_INTERP_T")) : (float)step / (float)sInterpSteps;
+
+        if (step > 1) {
+            interp_build(t, 0); /* (the first was built to decide whether the tick can be blended at all) */
+        }
+        if (getenv("BT3_INTERP_STEPLOG") != NULL) {
+            fprintf(stderr, "step %d of %d, t %.3f, frame %u\n", step, sInterpSteps, t, gGsFrame);
+        }
+        if (getenv("BT3_INTERP_3D") == NULL) { /* (BT3_INTERP_3D=1: the vertex programs' draws only, as the first prototype) */
+            interp_build_verts(t);
+            gsVerts = sInterpBlendVerts;
+        }
+        gsVuUni = sInterpBlend;
+        sBackend->frameEnd();
+        gsVuUni = real;
+        gsVerts = realVerts;
+        interp_present_log('B');
+        gInterpShown++;
+    } else {
+        interp_remember(); /* (only now: the in-between pictures were built from the previous tick's copy) */
+        sBackend->frameEnd();
+        interp_present_log('R');
+        scale_apply();
+    }
+}
+
+/* The tick's pictures after the first. They are due at even distances over the tick (33.4 ms / steps), counted from
+   when the first was shown: that is when the game had finished computing the tick, a millisecond or two after a
+   vertical blank, so "at the next blank" came too early (measured with one in-between picture: 15 ms after it, then
+   18 ms to the next). Called from Port_VBlank before it waits for the blank (`ahead` = what may be waited for here:
+   the pictures that fall before the blank) and after (those at it).
+   all = 1: the game is back with a new tick: what is left is dropped, except the tick's real picture. */
+void GsGpu_InterpPump(int ahead_ms, int all) {
+    if (sInterpNext == 0 || sBackend == NULL) {
+        return;
+    }
+    if (gsDrawCount != 0 || gsVertCount != 0 || gsVuUniCount != 0) {
+        /* the game drew before the tick's pictures were shown: its new draws would be mixed into the kept list */
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "bt3: interp: draws recorded before the tick's pictures were shown; they are dropped\n");
+        }
+        sInterpNext = 0;
+        return;
+    }
+    while (sInterpNext != 0) {
+        uint64_t due = sInterpBlendShown + (uint64_t)(sInterpNext - 1) * (sInterpTickNs / (uint64_t)sInterpSteps), now = gpu_now();
+
+        due = due > sInterpBlendTook ? due - sInterpBlendTook : 0; /* (replaying the list takes that long again) */
+        if (all) {
+            sInterpNext = sInterpSteps;
+        } else if (getenv("BT3_UNCAPPED") == NULL) {
+            if (ahead_ms < 0) {
+                /* before a vertical blank: only a picture that is shown and done with before the blank is due,
+                   so that the blank (the game's clock: input, sound) is never made late */
+                extern int Port_VBlankUsLeft(void);
+                uint64_t left = (uint64_t)Port_VBlankUsLeft() * 1000ull, wait = now < due ? due - now : 0;
+                if (wait + sInterpBlendTook + 700000ull > left) {
+                    return;
+                }
+            } else if (now < due && due - now > (uint64_t)ahead_ms * 1000000ull) {
+                return; /* not yet: at the next blank */
+            }
+            if (now < due) {
+                SDL_DelayPrecise(due - now);
+            }
+        }
+        if (sInterpNext == sInterpSteps && getenv("BT3_INTERP_ONLY") != NULL) {
+            sInterpNext = 0; /* testing: only in-between pictures are shown (so a screenshot holds one) */
+            return;
+        }
+        interp_counts_restore();
+        {
+            int step = sInterpNext;
+            sInterpNext = step == sInterpSteps ? 0 : step + 1;
+            interp_show(step);
         }
     }
-    sBackend->frameEnd();
-    interp_present_log('R');
-    scale_apply();
+}
+
+void GsGpu_InterpFlush(void) { /* (the name Port_VBlank knew it by) */
+    GsGpu_InterpPump(6, 0);
 }
 
 void GsGpu_FrameEnd(void) {
@@ -1892,9 +1962,17 @@ void GsGpu_FrameEnd(void) {
     if (sBackend != NULL) {
         int i;
 
-        GsGpu_InterpFlush(); /* (a picture still waiting: the game did not reach a vertical blank in between) */
+        if (sInterpNext != 0) { /* (pictures still waiting: the game did not reach its vertical blanks in between) */
+            uint32_t verts = gsVertCount, vuVerts = gsVuVertCount, vuIdx = gsVuIdxCount, vuUni = gsVuUniCount, draws = gsDrawCount;
+            /* cannot happen in the order the game works in (the list of the new tick is complete here); if it does,
+               the old tick's pictures are gone with its list */
+            if (verts != 0 || vuVerts != 0 || vuIdx != 0 || vuUni != 0 || draws != 0) {
+                sInterpNext = 0;
+            }
+        }
         if (gsInterp < 0) {
             gsInterp = getenv("BT3_INTERP") != NULL ? atoi(getenv("BT3_INTERP")) : Port_Setting("interp", 0);
+            gsInterp = gsInterp < 0 ? 0 : gsInterp > 3 ? 3 : gsInterp;
             sInterpPrev = malloc(MAX_VU_UNIFORMS * sizeof(Vu0Uniform));
             sInterpBlend = malloc(MAX_VU_UNIFORMS * sizeof(Vu0Uniform));
             sInterpPrevSig = malloc(MAX_VU_UNIFORMS * sizeof(uint32_t));
@@ -1905,17 +1983,23 @@ void GsGpu_FrameEnd(void) {
             sInterpPrims = malloc(INTERP_MAX_PRIMS * sizeof(InterpPrim));
             sInterpPrimUsed = malloc(INTERP_MAX_PRIMS);
         }
+        {
+            /* A scene the game shows at 60 a second (one vertical blank per picture: menus, the character select) has
+               half the time per tick and needs half the pictures: none at "60", one at "120". How many blanks this
+               tick will last is taken from the last one. */
+            extern unsigned gPortVBlanks;
+            unsigned blanks = gPortVBlanks - sInterpLastBlank;
+            sInterpLastBlank = gPortVBlanks;
+            blanks = blanks < 1 ? 1 : blanks > 2 ? 2 : blanks;
+            sInterpSteps = interp_steps() * (int)blanks / 2;
+            sInterpTickNs = (uint64_t)blanks * 16683350ull;
+        }
         if (gsInterp > 0) {
             interp_signatures(sInterpSig);
             sInterpPrimCount = interp_prims(sInterpPrims);
         }
-        if (gsInterp > 0 && interp_build()) {
-            Vu0Uniform *real = gsVuUni;
-            Vtx *realVerts = gsVerts;
-
-            if (getenv("BT3_INTERP_3D") == NULL) { /* (BT3_INTERP_3D=1: the vertex programs' draws only, as the first prototype) */
-                interp_build_verts(getenv("BT3_INTERP_T") != NULL ? (float)atof(getenv("BT3_INTERP_T")) : 0.5f);
-            }
+        if (gsInterp > 0 && sInterpSteps > 1 && interp_build(getenv("BT3_INTERP_T") != NULL ? (float)atof(getenv("BT3_INTERP_T")) : 1.0f / (float)sInterpSteps, 1)) {
+            uint64_t before;
 
             sInterpSaved.verts = gsVertCount;
             sInterpSaved.vuVerts = gsVuVertCount;
@@ -1928,25 +2012,16 @@ void GsGpu_FrameEnd(void) {
             for (i = 0; i < gsTargetCount && i < MAX_TARGETS; i++) {
                 sInterpSaved.tdraws[i] = gsTargets[i].draws;
             }
-            interp_remember();
-            gsVuUni = sInterpBlend;
-            if (getenv("BT3_INTERP_3D") == NULL) {
-                gsVerts = sInterpBlendVerts; /* (after interp_remember: that keeps the real vertices) */
-            }
-            sInterpBlendTook = gpu_now();
-            sBackend->frameEnd(); /* the in-between picture; the real one follows at the next vertical blank */
+            before = gpu_now();
+            interp_show(1); /* the first in-between picture; the others and the real one follow (GsGpu_InterpPump) */
             sInterpBlendShown = gpu_now();
-            sInterpBlendTook = sInterpBlendShown - sInterpBlendTook;
-            if (sInterpBlendTook > 8000000ull) {
-                sInterpBlendTook = 8000000ull;
+            sInterpBlendTook = sInterpBlendShown - before;
+            if (sInterpBlendTook > 4000000ull) {
+                sInterpBlendTook = 4000000ull;
             }
-            interp_present_log('B');
-            gsVuUni = real;
-            gsVerts = realVerts;
-            sInterpPending = 1;
-            gInterpShown++;
-            if (getenv("BT3_INTERP_LOG") != NULL && (gInterpShown + gInterpSkipped) % 300 == 0) {
-                fprintf(stderr, "interp: %u in-between pictures shown, %u left out; blocks: %u blended, %u not\n", gInterpShown, gInterpSkipped, gInterpPaired, gInterpUnpaired);
+            sInterpNext = 2;
+            if (getenv("BT3_INTERP_LOG") != NULL && (gInterpTicks++ % 300) == 299) {
+                fprintf(stderr, "interp: %u in-between pictures shown, %u ticks without; blocks: %u blended, %u not\n", gInterpShown, gInterpSkipped, gInterpPaired, gInterpUnpaired);
                 fprintf(stderr, "interp:   of those without a partner, %u moved with the camera\n", gInterpCamera);
                 fprintf(stderr, "interp:   effects and 2D: %u triangles, %u moved, %u still; not paired: %u new kind, %u too far, %u other texture piece, %u none free\n",
                         gInterpTris, gInterpTrisBlended, gInterpWhy[3], gInterpWhy[0], gInterpWhy[1], gInterpWhy[2], gInterpWhy[4]);

@@ -535,15 +535,18 @@ static void video_tab(PortVideo &v) {
     {
         // In-between pictures (gs_draw.c): the fight is computed 30 times a second, as on the console; with this
         // on one more picture is drawn between each two. The game itself, its replays and online play are the same.
-        bool on = gsInterp > 0;
-        if (ImGui::Checkbox("Smooth motion: 60 pictures a second in fights (experimental)", &on)) {
-            gsInterp = on ? 1 : 0;
+        static const char *kSmooth[] = { "Off (30, as the console)", "60 pictures a second", "120 pictures a second", "240 pictures a second" };
+        int smooth = gsInterp < 0 ? 0 : gsInterp > 3 ? 3 : gsInterp;
+        ImGui::SetNextItemWidth(416.0f);
+        if (ImGui::Combo("Smooth motion", &smooth, kSmooth, 4)) {
+            gsInterp = smooth;
             Port_SettingSave("interp", gsInterp);
             Port_SettingsWrite();
         }
-        ImGui::SetItemTooltip("The game computes a fight 30 times a second. With this on, one more picture is drawn\n"
-                              "between each two, half way. The fight itself does not change, and neither does online play.\n"
-                              "The newest picture reaches the screen about 17 ms later than without. F9 switches it too.");
+        ImGui::SetItemTooltip("Experimental. The game computes a fight 30 times a second. With this, more pictures are\n"
+                              "drawn between each two. The fight itself does not change, and neither does online play.\n"
+                              "The newest picture reaches the screen later: 17 ms at 60, 25 ms at 120, 29 ms at 240.\n"
+                              "Choose what your screen can show. F9 switches it off and on.");
     }
     {
         bool on = meter_on();

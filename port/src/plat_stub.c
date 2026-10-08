@@ -69,8 +69,16 @@ PORT_HOST unsigned gPortPaceShiftNs = 0;
 /* Vertical blanks the game has really gone through (not the ones run again after a rollback): host data. */
 PORT_HOST unsigned gPortLiveBlanks = 0;
 
+PORT_HOST static unsigned long long sPaceNext = 0; /* when the coming vertical blank is due */
+#define next sPaceNext
+/* How long until the coming vertical blank, in microseconds (0: it is due or past, or there is no grid yet). For
+   what wants to do something before it without making it late (gs/gs_draw.c: in-between pictures). */
+int Port_VBlankUsLeft(void) {
+    unsigned long long t = now_ns();
+    return sPaceNext > t && sPaceNext - t < 100000000ull ? (int)((sPaceNext - t) / 1000ull) : 0;
+}
+
 static void vblank_wait(void) {
-    PORT_HOST static unsigned long long next = 0;
     struct timespec ts;
     unsigned long long t = now_ns(), after;
 
@@ -139,6 +147,7 @@ static void vblank_wait(void) {
     }
 }
 
+#undef next
 static unsigned char sPadLast[2][18]; /* (defined with the pads below) */
 void Port_VBlank(void) {
     {
@@ -156,13 +165,18 @@ void Port_VBlank(void) {
         if (Port_NetSession() || again) {
             gPortResim = warp || again; /* an online session's start-up up to the versus menu is not shown and not timed */
         }
-        if ((GsGpu_Enabled() || getenv("BT3_PACED") != NULL) && getenv("BT3_UNCAPPED") == NULL && !warp && !again) {
-            vblank_wait();
-        }
         {
-            extern void GsGpu_InterpFlush(void); /* gs/gs_draw.c: the real picture after its in-between picture */
+            /* gs/gs_draw.c: the pictures of the tick that follow its first (in-between pictures and the real one):
+               those due before this blank now, those due at it after the wait */
+            extern void GsGpu_InterpPump(int ahead_ms, int all);
             if (GsGpu_Enabled()) {
-                GsGpu_InterpFlush();
+                GsGpu_InterpPump(-1, 0); /* (-1: what can be finished before the blank) */
+            }
+            if ((GsGpu_Enabled() || getenv("BT3_PACED") != NULL) && getenv("BT3_UNCAPPED") == NULL && !warp && !again) {
+                vblank_wait();
+            }
+            if (GsGpu_Enabled()) {
+                GsGpu_InterpPump(6, 0);
             }
         }
     }
