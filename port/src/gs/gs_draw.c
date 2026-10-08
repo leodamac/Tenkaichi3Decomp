@@ -1270,14 +1270,186 @@ int GsGpu_Init(void) {
     return 1;
 }
 
+/* ---------------------------------------------------------------------------------- in-between pictures
+ * The game computes 30 pictures a second (every loop waits for two vertical blanks). With BT3_INTERP=1 (setting
+ * "interp") the renderer shows one more between each two: when the game has finished picture n, the list of n is
+ * first replayed with the vertex programs' matrices (bones, pivots, the screen matrix: Vu0Uniform) half way from
+ * those of n - 1, and the real n follows one vertical blank later (GsGpu_InterpFlush, from Port_VBlank). The
+ * game itself is untouched: same simulation, same inputs, same online play. The cost is that picture n is seen
+ * one vertical blank (16.7 ms) later than without.
+ *
+ * PROTOTYPE. Blended: what the vertex programs draw (fighters, stage, shadows, debris). Not blended: what the
+ * game transforms itself (effects, HUD, 2D), which stays that of picture n. A draw of n is paired with the draw
+ * of n - 1 at the same place in the list if it is the same kind of draw (signature below); a pair whose model
+ * would jump far on screen (a camera cut, a teleport) is not blended, and when most are like that no in-between
+ * picture is shown at all. */
+int gsInterp = -1;
+static Vu0Uniform *sInterpPrev, *sInterpBlend;
+static uint32_t *sInterpPrevSig, *sInterpSig;
+static uint32_t sInterpPrevCount;
+static int sInterpPending;
+static struct { uint32_t verts, vuVerts, vuIdx, vuUni, draws; int anchor; unsigned skipped, native; unsigned tdraws[MAX_TARGETS]; } sInterpSaved;
+unsigned gInterpShown, gInterpSkipped; /* in-between pictures shown / left out since the start */
+
+static void interp_signatures(uint32_t *sig) {
+    uint32_t n;
+
+    memset(sig, 0, gsVuUniCount * sizeof(uint32_t));
+    for (n = 0; n < gsDrawCount; n++) {
+        const GsDraw *d = &gsDraws[n];
+        if (d->vu != 0 && d->uniform >= 0 && (uint32_t)d->uniform < gsVuUniCount) {
+            sig[d->uniform] = sig[d->uniform] * 31u + (d->count * 2654435761u ^ (uint32_t)d->tex ^ (uint32_t)d->pipeline << 20 ^ (uint32_t)d->vu << 28) + 1u;
+        }
+    }
+}
+
+/* Where the model's pivot lands on the GS screen (pixels), 0 if behind the eye. */
+static int interp_screen_pos(const Vu0Uniform *u, float *x, float *y) {
+    float p[4], s[4];
+    int i;
+
+    for (i = 0; i < 4; i++) { /* boneA * (0 - pivotA, 1) */
+        p[i] = -(u->boneA[i] * u->pivotA[0] + u->boneA[4 + i] * u->pivotA[1] + u->boneA[8 + i] * u->pivotA[2]) + u->boneA[12 + i];
+    }
+    for (i = 0; i < 4; i++) {
+        s[i] = u->screen[i] * p[0] + u->screen[4 + i] * p[1] + u->screen[8 + i] * p[2] + u->screen[12 + i];
+    }
+    if (!(s[3] > 0.0001f) && !(s[3] < -0.0001f)) {
+        return 0;
+    }
+    *x = s[0] / s[3];
+    *y = s[1] / s[3];
+    return s[3] > 0.0f ? 1 : -1;
+}
+
+/* Fills sInterpBlend for the frame just recorded; 0 = no in-between picture for this one. */
+static int interp_build(void) {
+    uint32_t i, paired = 0, jumped = 0;
+    const float t = 0.5f;
+
+    if (gsVuUniCount == 0 || sInterpPrevCount == 0) {
+        return 0;
+    }
+    for (i = 0; i < gsVuUniCount; i++) {
+        const Vu0Uniform *c = &gsVuUni[i];
+        Vu0Uniform *o = &sInterpBlend[i];
+        float xa, ya, xb, yb;
+        int sa, sb, k;
+
+        *o = *c;
+        if (i >= sInterpPrevCount || sInterpSig[i] != sInterpPrevSig[i] || sInterpSig[i] == 0) {
+            continue;
+        }
+        sa = interp_screen_pos(&sInterpPrev[i], &xa, &ya);
+        sb = interp_screen_pos(c, &xb, &yb);
+        if (sa != sb || (sa != 0 && (fabsf(xa - xb) > 160.0f || fabsf(ya - yb) > 120.0f))) {
+            jumped++;
+            continue;
+        }
+        paired++;
+        {
+            const float *pf = (const float *)&sInterpPrev[i], *cf = (const float *)c;
+            float *of = (float *)o;
+            /* boneA, boneB, pivotA, pivotB, screen, light: the first 60 floats; colours and misc stay picture n's */
+            for (k = 0; k < 60; k++) {
+                of[k] = pf[k] + (cf[k] - pf[k]) * t;
+            }
+        }
+    }
+    return paired != 0 && jumped * 2 <= paired;
+}
+
+static void interp_remember(void) {
+    memcpy(sInterpPrev, gsVuUni, gsVuUniCount * sizeof(Vu0Uniform));
+    memcpy(sInterpPrevSig, sInterpSig, gsVuUniCount * sizeof(uint32_t));
+    sInterpPrevCount = gsVuUniCount;
+}
+
+/* The real picture n, one vertical blank after its in-between picture (Port_VBlank). */
+void GsGpu_InterpFlush(void) {
+    int i;
+
+    if (!sInterpPending || sBackend == NULL) {
+        return;
+    }
+    sInterpPending = 0;
+    if (gsInterp == 2) {
+        return; /* testing: only the in-between pictures are shown (so a screenshot holds one) */
+    }
+    if (gsDrawCount != 0 || gsVertCount != 0 || gsVuUniCount != 0) {
+        /* the game drew before the blank: its new draws would be mixed into the kept list. Not expected. */
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "bt3: interp: draws recorded before the picture was shown; that picture is dropped\n");
+        }
+        return;
+    }
+    gsVertCount = sInterpSaved.verts;
+    gsVuVertCount = sInterpSaved.vuVerts;
+    gsVuIdxCount = sInterpSaved.vuIdx;
+    gsVuUniCount = sInterpSaved.vuUni;
+    gsDrawCount = sInterpSaved.draws;
+    gsAnchor = sInterpSaved.anchor;
+    gsSkipped = sInterpSaved.skipped;
+    gsNative = sInterpSaved.native;
+    for (i = 0; i < gsTargetCount && i < MAX_TARGETS; i++) {
+        gsTargets[i].draws = sInterpSaved.tdraws[i];
+    }
+    sBackend->frameEnd();
+    scale_apply();
+}
+
 void GsGpu_FrameEnd(void) {
     if (gPortResim) { /* a frame that is only being re-run: nothing was recorded, nothing is shown */
         return;
     }
     uint64_t t0 = gpu_now();
     if (sBackend != NULL) {
-        sBackend->frameEnd();
-        scale_apply();
+        int i;
+
+        GsGpu_InterpFlush(); /* (a picture still waiting: the game did not reach a vertical blank in between) */
+        if (gsInterp < 0) {
+            gsInterp = getenv("BT3_INTERP") != NULL ? atoi(getenv("BT3_INTERP")) : Port_Setting("interp", 0);
+            sInterpPrev = malloc(MAX_VU_UNIFORMS * sizeof(Vu0Uniform));
+            sInterpBlend = malloc(MAX_VU_UNIFORMS * sizeof(Vu0Uniform));
+            sInterpPrevSig = malloc(MAX_VU_UNIFORMS * sizeof(uint32_t));
+            sInterpSig = malloc(MAX_VU_UNIFORMS * sizeof(uint32_t));
+        }
+        if (gsInterp > 0) {
+            interp_signatures(sInterpSig);
+        }
+        if (gsInterp > 0 && interp_build()) {
+            Vu0Uniform *real = gsVuUni;
+
+            sInterpSaved.verts = gsVertCount;
+            sInterpSaved.vuVerts = gsVuVertCount;
+            sInterpSaved.vuIdx = gsVuIdxCount;
+            sInterpSaved.vuUni = gsVuUniCount;
+            sInterpSaved.draws = gsDrawCount;
+            sInterpSaved.anchor = gsAnchor;
+            sInterpSaved.skipped = gsSkipped;
+            sInterpSaved.native = gsNative;
+            for (i = 0; i < gsTargetCount && i < MAX_TARGETS; i++) {
+                sInterpSaved.tdraws[i] = gsTargets[i].draws;
+            }
+            interp_remember();
+            gsVuUni = sInterpBlend;
+            sBackend->frameEnd(); /* the in-between picture; the real one follows at the next vertical blank */
+            gsVuUni = real;
+            sInterpPending = 1;
+            gInterpShown++;
+            if (getenv("BT3_INTERP_LOG") != NULL && (gInterpShown + gInterpSkipped) % 300 == 0) {
+                fprintf(stderr, "interp: %u in-between pictures shown, %u left out\n", gInterpShown, gInterpSkipped);
+            }
+        } else {
+            if (gsInterp > 0) {
+                interp_remember();
+                gInterpSkipped++;
+            }
+            sBackend->frameEnd();
+            scale_apply();
+        }
     }
     gGpuEndNs += gpu_now() - t0;
 }

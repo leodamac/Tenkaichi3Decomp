@@ -511,6 +511,11 @@ static void vk_frame_end(void) {
         if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) {
             exit(0);
         }
+        if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.key == SDLK_F9) { /* prototype: in-between pictures on / off */
+            extern int gsInterp;
+            gsInterp = gsInterp > 0 ? 0 : 1;
+            fprintf(stderr, "bt3: in-between pictures %s\n", gsInterp ? "ON" : "off");
+        }
         if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.key == SDLK_F11) {
             GsDraw_FullscreenToggle();
         }

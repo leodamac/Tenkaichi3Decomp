@@ -159,6 +159,12 @@ void Port_VBlank(void) {
         if ((GsGpu_Enabled() || getenv("BT3_PACED") != NULL) && getenv("BT3_UNCAPPED") == NULL && !warp && !again) {
             vblank_wait();
         }
+        {
+            extern void GsGpu_InterpFlush(void); /* gs/gs_draw.c: the real picture after its in-between picture */
+            if (GsGpu_Enabled()) {
+                GsGpu_InterpFlush();
+            }
+        }
     }
     {   /* BT3_PAD_TABLE=<file>: what each pad read during the blank that ends here, 36 bytes per blank (the input
            of a session by blank and by pad: gs/net.c plays one player's column of it for its tests) */
