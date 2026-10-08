@@ -75,7 +75,11 @@ typedef struct Voice {
     int stopping;
 } Voice;
 
-static uint8_t sSpu[SPU_SIZE];
+/* Beside the sound chip's memory: room for the clip banks this copy plays in the place of the game's (voice_own_bank). */
+#define OWN_SLOT 0x100000 /* a megabyte each; the largest voice bank file of the disc has 591,104 bytes */
+#define SPU_TOTAL (SPU_SIZE + 8 * OWN_SLOT)
+static uint8_t sSpu[SPU_TOTAL];
+static uint8_t *sOwnTables[8]; /* the two tables of such a bank (one allocation) */
 static Bank sBanks[8];
 static Voice sVoices[VOICES];
 static SDL_AudioStream *sStream;
@@ -123,7 +127,7 @@ static int lookup(const Bank *b, int id, uint32_t *start, uint32_t *rate) {
     o = le32(vagi + 0x10 + 4 * vag);
     *start = b->spu + le32(vagi + o);
     *rate = le16(vagi + o + 4);
-    return *start + 16 <= SPU_SIZE && *rate != 0;
+    return *start + 16 <= SPU_TOTAL && *rate != 0;
 }
 
 /* Decodes the voice's next 16-byte block into v->buf. */
@@ -132,7 +136,7 @@ static void decode_block(Voice *v) {
     const uint8_t *p;
     int shift, filter, flags, i;
 
-    if (v->last || v->pos + 16 > SPU_SIZE) {
+    if (v->last || v->pos + 16 > SPU_TOTAL) {
         v->ended = 1;
         v->have = 0;
         return;
@@ -312,6 +316,114 @@ static void stop(int mask, int id, int handle) {
 
 /* ------------------------------------------------------------ what the game calls (Sony's library functions) */
 
+/* The fighters' voices in an online match, for a player who chose the second voice set (see snd_adx.c: the match
+   itself computes with the default set). The game loads the default set's bank of a fighter (file 0xC7B + fighter
+   of partition 1) and names clips by number; the game never asks whether a clip is still playing, and the two sets'
+   banks have the same clips under the same numbers (checked for all 161 fighters: as many samples, as many
+   sequences). So the bank the game sets is recognised by the start of its header table and this copy plays the
+   same numbers from the other set's bank (file 0xBDA + fighter), read here from the disc's files. */
+extern int Port_FilePath(int ptid, int flid, const char *fname, char *out, int size); /* plat_file.c */
+#define VOICE_BANKS 161
+#define VOICE_BANK_DEFAULT (0xC7B - 1) /* file numbers of partition 1 (id - 1) */
+#define VOICE_BANK_OTHER (0xBDA - 1)
+
+static uint8_t *bank_file(int flid, long *size) {
+    char path[512];
+    uint8_t *b = NULL;
+    FILE *fp;
+
+    if (!Port_FilePath(1, flid, NULL, path, sizeof(path)) || (fp = fopen(path, "rb")) == NULL) {
+        return NULL;
+    }
+    fseek(fp, 0, SEEK_END);
+    *size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (*size > 0x50 && (b = malloc((size_t)*size)) != NULL && fread(b, 1, (size_t)*size, fp) != (size_t)*size) {
+        free(b);
+        b = NULL;
+    }
+    fclose(fp);
+    return b;
+}
+
+/* The three parts of a bank file: a count and the parts' offsets at its start. Which is which is told by the chunk
+   names. 0 = not such a file. */
+static int bank_parts(const uint8_t *b, long size, uint32_t *hd, uint32_t *hdSize, uint32_t *sq, uint32_t *sqSize, uint32_t *smp, uint32_t *smpSize) {
+    uint32_t n = le32(b), i;
+    int have = 0;
+
+    if (n != 3) {
+        return 0;
+    }
+    for (i = 0; i < 3; i++) {
+        uint32_t o = le32(b + 4 + 4 * i), e = le32(b + 8 + 4 * i);
+        if (o >= e || e > (uint32_t)size) {
+            return 0;
+        }
+        if (chunk(b + o, "Vagi", e - o < 0x8000 ? e - o : 0x8000) != NULL) {
+            *hd = o; *hdSize = e - o; have |= 1;
+        } else if (chunk(b + o, "Sesq", e - o < 0x4000 ? e - o : 0x4000) != NULL) {
+            *sq = o; *sqSize = e - o; have |= 2;
+        } else {
+            *smp = o; *smpSize = e - o; have |= 4;
+        }
+    }
+    return have == 7;
+}
+
+/* Bank slot `slot` was just set by the game: if it is a fighter's default voice bank and this player chose the other
+   voice set, the slot plays that set's bank. */
+static void voice_own_bank(int slot) {
+    extern int Port_NetVoiceAlt(void); /* net.c */
+    static uint8_t (*sig)[64]; /* the first 64 bytes of each default bank's header table */
+    static int tried;
+    Bank *bk = &sBanks[slot];
+    int c, found = -1;
+    long size;
+    uint8_t *b;
+    uint32_t hd, hdSize, sq, sqSize, smp, smpSize;
+
+    free(sOwnTables[slot]);
+    sOwnTables[slot] = NULL;
+    if (!Port_NetVoiceAlt() || bk->hd == NULL) {
+        return;
+    }
+    if (!tried) {
+        tried = 1;
+        sig = calloc(VOICE_BANKS, sizeof(*sig));
+        for (c = 0; sig != NULL && c < VOICE_BANKS; c++) {
+            if ((b = bank_file(VOICE_BANK_DEFAULT + c, &size)) != NULL) {
+                if (bank_parts(b, size, &hd, &hdSize, &sq, &sqSize, &smp, &smpSize) && hdSize >= 64) {
+                    memcpy(sig[c], b + hd, 64);
+                }
+                free(b);
+            }
+        }
+    }
+    for (c = 0; sig != NULL && c < VOICE_BANKS && found < 0; c++) {
+        if (sig[c][0] != 0 && memcmp(sig[c], bk->hd, 64) == 0) {
+            found = c;
+        }
+    }
+    if (found < 0 || (b = bank_file(VOICE_BANK_OTHER + found, &size)) == NULL) {
+        return; /* not a fighter's voice bank (the common effects, a stage's), or the other set has none */
+    }
+    if (bank_parts(b, size, &hd, &hdSize, &sq, &sqSize, &smp, &smpSize) && smpSize <= OWN_SLOT &&
+        (sOwnTables[slot] = malloc(hdSize + sqSize)) != NULL) {
+        memcpy(sOwnTables[slot], b + hd, hdSize);
+        memcpy(sOwnTables[slot] + hdSize, b + sq, sqSize);
+        memcpy(&sSpu[SPU_SIZE + (uint32_t)slot * OWN_SLOT], b + smp, smpSize);
+        memset(&sSpu[SPU_SIZE + (uint32_t)slot * OWN_SLOT] + smpSize, 0, OWN_SLOT - smpSize);
+        bk->spu = SPU_SIZE + (uint32_t)slot * OWN_SLOT;
+        bk->hd = sOwnTables[slot];
+        bk->sq = sOwnTables[slot] + hdSize;
+        if (getenv("BT3_SND_VERBOSE") != NULL) {
+            fprintf(stderr, "se: bank slot %d is fighter %d's voices: playing the other voice set's bank\n", slot, found);
+        }
+    }
+    free(b);
+}
+
 /* the game's structure: its two pointers are 4 bytes wide in every build (PS2 layout) */
 typedef struct SifDmaData { uint32_t data, addr; int32_t size, mode; } SifDmaData;
 
@@ -366,6 +478,7 @@ int sceSifCallRpc(void *client, int fno, int mode, void *send, int sendSize, voi
             sBanks[slot].sq = (const uint8_t *)(uintptr_t)(uint32_t)w[3];
             sBanks[slot].paused = 0;
             if (sBanks[slot].volume == 0.0f) { sBanks[slot].volume = 1.0f; }
+            voice_own_bank(slot);
         }
         break;
     }

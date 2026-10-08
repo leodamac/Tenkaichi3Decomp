@@ -243,11 +243,58 @@ static void stop(Player *p) {
     p->stat = ADXT_STAT_STOP;
 }
 
+/* An online match computes with the default voice set on both sides (net.c). A player who chose the other one hears
+   it all the same: the stream that is PLAYED is the other set's file of the same line, while what the game is told
+   about it (how long it lasts: view_start) stays the default file's, so the two copies agree. Ids of partition 2
+   (file number + 0xD48), default set -> second set:
+       menu guides      0x87F2..0x8D4D  - 0x55C     (VOICE_LANG2_OFFSET)
+       fighters' lines  0xCC32..0x10B15 - 0x3EE4    (161 fighters, 100 lines each)
+       announcer        0x10B6C..0x10BA3 - 0x38
+   Checked against the disc: every id of these ranges and its partner are streams. */
+static const char *voice_own_path(const char *path, char *buf, size_t size) {
+    extern int Port_NetVoiceAlt(void); /* net.c */
+    const char *dir = strstr(path, "pzs3us2/"), *num;
+    int fid, id, other = 0;
+
+    if (dir == NULL || !Port_NetVoiceAlt()) {
+        return path;
+    }
+    num = dir + 8;
+    if (sscanf(num, "%d.bin", &fid) != 1) {
+        return path;
+    }
+    id = fid + 0xD48;
+    if (id >= 0x87F2 && id < 0x8D4E) {
+        other = id - 0x55C;
+    } else if (id >= 0xCC32 && id < 0x10B16) {
+        other = id - 0x3EE4;
+    } else if (id >= 0x10B6C && id < 0x10BA4) {
+        other = id - 0x38;
+    } else {
+        return path;
+    }
+    snprintf(buf, size, "%.*s%05d.bin", (int)(num - path), path, other - 0xD48);
+    {
+        FILE *fp = fopen(buf, "rb");
+        if (fp == NULL) {
+            return path; /* (not there: the default one) */
+        }
+        fclose(fp);
+    }
+    if (getenv("BT3_SND_VERBOSE") != NULL) {
+        fprintf(stderr, "adx: voice %#x played from the other voice set (%#x)\n", id, other);
+    }
+    return buf;
+}
+
 static void start(Player *p, const char *path) {
     SDL_AudioSpec spec;
     FILE *fp;
     long size;
     uint32_t header, highpass;
+    char own[512];
+
+    path = voice_own_path(path, own, sizeof(own));
 
     if (gPortResim && p->stream != NULL && strcmp(p->path, path) == 0) {
         return; /* a frame that is only being re-run starts the stream that is playing already: it plays on */

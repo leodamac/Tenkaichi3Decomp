@@ -454,6 +454,36 @@ static void net_start(int role, const char *host, const char *join) {
     }
 }
 
+int Port_NetActive(void);
+
+/* The voice language the player chose in the game's options, read from their own save (bit 0 of the flags word at
+   0x1608: set = the first choice of the menu, which is what a new save has; clear = the second voice set). An
+   online match starts from an empty save on both sides, so both compute with the default; this choice is kept
+   aside for what this copy plays (BT3_NET_VOICE=alt; snd_adx.c, snd_se.c). 1 = the second set. */
+static int own_voice_alt(void) {
+    const char *root = getenv("BT3_SAVES") != NULL ? getenv("BT3_SAVES") : "saves";
+    char path[600];
+    unsigned char w[4];
+    FILE *fp;
+    int alt = 0;
+
+    snprintf(path, sizeof(path), "%s/card1/BASLUS-21678DBZT3/BASLUS-21678DBZT3", root);
+    fp = fopen(path, "rb");
+    if (fp != NULL) {
+        if (fseek(fp, 0x1608, SEEK_SET) == 0 && fread(w, 1, 4, fp) == 4) {
+            alt = !(w[0] & 1);
+        }
+        fclose(fp);
+    }
+    return alt;
+}
+
+/* Whether this copy plays the second voice set in the online match it is in (the player's own choice, above). */
+int Port_NetVoiceAlt(void) {
+    const char *v = getenv("BT3_NET_VOICE");
+    return Port_NetActive() && v != NULL && strcmp(v, "alt") == 0;
+}
+
 /* Which player this copy plays in an online match (0 the host, 1 the one who joined). */
 int Port_NetMe(void) {
     return sMe;
@@ -727,6 +757,9 @@ static void relaunch(int role, const char *join, int port) {
         SETENV("BT3_NET_SESSION", "1");
         SETENV("BT3_SOUND_TICKS", "1");
         SETENV("BT3_NOMOVIE", "1");
+        if (getenv("BT3_NET_VOICE") == NULL) { /* (before the save folder changes: it is read from the player's own) */
+            SETENV("BT3_NET_VOICE", own_voice_alt() ? "alt" : "default");
+        }
         SETENV("BT3_SAVES", "net_session");
         /* the session's own save folder starts empty: both sides begin from the game's defaults */
         remove("net_session/card1/BASLUS-21678DBZT3/BASLUS-21678DBZT3");
@@ -790,6 +823,7 @@ void Port_NetSessionBegin(int role, const char *address, int port) {
     remove("net_session/card1/BASLUS-21678DBZT3/BASLUS-21678DBZT3");
     remove("net_session/card1/BASLUS-21678DBZT3/icon.sys");
     remove("net_session/card1/BASLUS-21678DBZT3/dbzsm.ico");
+    put_env("BT3_NET_VOICE", own_voice_alt() ? "alt" : "default");
     put_env("BT3_SAVES", "net_session");
     snprintf(host, sizeof(host), "%d", port);
     snprintf(join, sizeof(join), "%s:%d", address, port);
