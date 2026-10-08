@@ -54,6 +54,7 @@ enum { NET_VERSION = 3, IN_HEAD = 32 }; /* 3 (0.1.15): the host's battle rules t
 static int sVersionBad; /* the other side answered with another version */
 static const uint32_t kVersion = NET_VERSION;
 #include "net_match.h"
+#include "net_relay.h"
 static int sLobbyOther;
 
 /* What the meter shows (ui.cpp): the round trip time, and per second how often the game went back, how far, and
@@ -97,6 +98,11 @@ void Port_NetNameSet(const char *name) {
 /* A match found with a room code (the lobby, below): the local port the lobby's socket had, which the session's
    socket takes again, and for the host the address the other player's greeting came from. */
 static int sCodeLocalPort, sCodePunchSet;
+/* The lobby's socket, handed to the session that follows (a match found with a room code, begun without a restart).
+   It is not closed and opened again on the same port: while it is closed, packets from the other side meet a
+   closed port, the system answers "unreachable", and a relay stops passing that player's packets on (seen with
+   Cloudflare's: the match's greeting never arrived). It also keeps the routers' view of the conversation whole. */
+static int sHandSock = -1, sFromLobby;
 static struct sockaddr_in sCodePunch;
 
 /* The match's rules, chosen by the host in the lobby window (the game's own versus menu is not shown in a session):
@@ -165,10 +171,42 @@ static int sLatencyMs;
 static struct { uint64_t due; int n; uint8_t data[IN_HEAD + 16 * PAD]; } sQueue[256];
 static unsigned sQueueHead, sQueueTail;
 
+/* Every packet of a match goes out and comes in through these two: the host of a match found with a room code may
+   hold a relay address (net_relay.c), and then the other player's packets can arrive wrapped by the relay and must
+   go back the same way. Without a relay they are plain sendto / recvfrom. */
+static void net_send(const void *buf, int n, const struct sockaddr_in *to) {
+    if (Relay_IsPeer(to)) {
+        Relay_Send(sSock, buf, n, to);
+    } else {
+        sendto(sSock, (const char *)buf, n, 0, (const struct sockaddr *)to, sizeof(*to));
+    }
+}
+
+static int net_recv(uint8_t *pkt, int size, struct sockaddr_in *from) {
+    Relay_Tick(sSock);
+    for (;;) {
+        socklen_t fromLen = sizeof(*from);
+        uint8_t *data = NULL;
+        int len = 0, n = (int)recvfrom(sSock, (char *)pkt, size, 0, (struct sockaddr *)from, &fromLen), kind;
+        if (n <= 0) {
+            return n;
+        }
+        kind = Relay_Unwrap(pkt, n, from, &data, &len);
+        if (kind == 2) {
+            Relay_SawDirect(from);
+            return n;
+        }
+        if (kind == 1) {
+            memmove(pkt, data, (size_t)len);
+            return len;
+        }
+    }
+}
+
 static void queue_flush(void) {
     uint64_t now = SDL_GetTicksNS();
     while (sQueueHead != sQueueTail && sQueue[sQueueHead % 256].due <= now) {
-        sendto(sSock, (const char *)sQueue[sQueueHead % 256].data, sQueue[sQueueHead % 256].n, 0, (struct sockaddr *)&sPeer, sizeof(sPeer));
+        net_send(sQueue[sQueueHead % 256].data, sQueue[sQueueHead % 256].n, &sPeer);
         sQueueHead++;
     }
 }
@@ -184,7 +222,7 @@ static void send_to_peer(const void *buf, int n) {
         sQueueTail++;
         return;
     }
-    sendto(sSock, buf, n, 0, (struct sockaddr *)&sPeer, sizeof(sPeer));
+    net_send(buf, n, &sPeer);
 }
 
 static void send_inputs(void) {
@@ -216,7 +254,7 @@ static int receive(void) {
     int got = 0, n;
 
     queue_flush();
-    while ((n = (int)recvfrom(sSock, (char *)pkt, sizeof(pkt), 0, (struct sockaddr *)&from, &fromLen)) >= 8) {
+    while ((n = net_recv(pkt, (int)sizeof(pkt), &from)) >= 8) {
         uint32_t magic, type;
         memcpy(&magic, pkt, 4);
         memcpy(&type, pkt + 4, 4);
@@ -249,7 +287,7 @@ static int receive(void) {
                 sNames[0][NAME_LEN - 1] = '\0';
             }
             sCfgGot = 2;
-            sendto(sSock, (const char *)ack, sizeof(ack), 0, (struct sockaddr *)&from, sizeof(from));
+            net_send(ack, sizeof(ack), &from);
         } else if (type == T_CONFIG_ACK && sMode == 1) {
             sCfgAcked = 1;
         } else if (type == T_BYE && sConnected) {
@@ -259,6 +297,11 @@ static int receive(void) {
             if (!said++) {
                 fprintf(stderr, "bt3: net: a copy of another version tried to join; both players need the same release\n");
             }
+        } else if (type == T_HELLO && sMode == 1 && sFromLobby && n < 12 + NAME_LEN) {
+            /* a greeting of the other side's lobby, still on its way or sent again because this side's answers
+               were lost: answered as the lobby did, so that the other side starts its session too */
+            uint32_t ack[3] = {MAGIC, T_HELLO_ACK, NET_VERSION};
+            net_send(ack, sizeof(ack), &from);
         } else if (type == T_HELLO && sMode == 1) {
             uint32_t ack[6 + NAME_LEN / 4] = {MAGIC, T_HELLO_ACK, (uint32_t)sDelay, (uint32_t)sRollMax, NET_VERSION, sRules};
             memcpy(&ack[6], sMyName, NAME_LEN);
@@ -269,7 +312,9 @@ static int receive(void) {
             memcpy(sNames[0], sMyName, NAME_LEN);
             sPeer = from; /* the host learns the other side's address from its greeting */
             sConnected = 1;
-            sendto(sSock, (const char *)ack, sizeof(ack), 0, (struct sockaddr *)&sPeer, sizeof(sPeer));
+            net_send(ack, sizeof(ack), &sPeer);
+        } else if (type == T_HELLO_ACK && sMode == 2 && sFromLobby && n < 20) {
+            /* an answer to the lobby's greeting, still in the socket the session took over: nothing to do */
         } else if (type == T_HELLO_ACK && sMode == 2) {
             if (!(n >= 20 && memcmp(pkt + 16, &kVersion, 4) == 0)) {
                 sVersionBad = 1;
@@ -348,18 +393,22 @@ static void net_start(int role, const char *host, const char *join) {
     memset(sIn, 0, sizeof(sIn));
     memset(sHave, 0, sizeof(sHave)); /* (a second session in one run starts as clean as the first) */
     sWaitNs = sWaits = 0;
+    sFromLobby = sHandSock >= 0;
+    if (sFromLobby) {
+        sSock = sHandSock;
+        sHandSock = -1;
+    } else {
 #ifdef _WIN32
-    {
         WSADATA w;
         u_long on = 1;
         WSAStartup(MAKEWORD(2, 2), &w);
         sSock = (int)socket(AF_INET, SOCK_DGRAM, 0);
         ioctlsocket(sSock, FIONBIO, &on);
-    }
 #else
-    sSock = socket(AF_INET, SOCK_DGRAM, 0);
-    fcntl(sSock, F_SETFL, fcntl(sSock, F_GETFL, 0) | O_NONBLOCK);
+        sSock = socket(AF_INET, SOCK_DGRAM, 0);
+        fcntl(sSock, F_SETFL, fcntl(sSock, F_GETFL, 0) | O_NONBLOCK);
 #endif
+    }
     sMe = sMode - 1;
     if (getenv("BT3_NET_LOCALPORT") != NULL && sCodeLocalPort == 0) { /* (across the restart into the session) */
         sCodeLocalPort = atoi(getenv("BT3_NET_LOCALPORT"));
@@ -421,7 +470,7 @@ static void net_start(int role, const char *host, const char *join) {
     sPeer.sin_family = AF_INET;
     if (sMode == 1) {
         local.sin_port = htons((uint16_t)atoi(host));
-        if (bind(sSock, (struct sockaddr *)&local, sizeof(local)) != 0) {
+        if (!sFromLobby && bind(sSock, (struct sockaddr *)&local, sizeof(local)) != 0) {
             fprintf(stderr, "bt3: net: cannot use port %s\n", host);
             exit(2);
         }
@@ -445,7 +494,7 @@ static void net_start(int role, const char *host, const char *join) {
             }
             memcpy(&sPeer.sin_addr, he->h_addr_list[0], sizeof(sPeer.sin_addr));
         }
-        if (sCodeLocalPort != 0) {
+        if (sCodeLocalPort != 0 && !sFromLobby) {
             /* a match found with a room code: from the port the lobby used, so that the routers on the way keep
                taking this for the same conversation */
             local.sin_port = htons((uint16_t)sCodeLocalPort);
@@ -458,13 +507,13 @@ static void net_start(int role, const char *host, const char *join) {
         uint64_t now = SDL_GetTicksNS();
         if (sMode == 1 && sCodePunchSet && now - last > 100000000ull) {
             uint32_t punch[2] = {MAGIC, T_PUNCH}; /* (room codes: keeps this side's router open for the one who joins) */
-            sendto(sSock, (const char *)punch, sizeof(punch), 0, (struct sockaddr *)&sCodePunch, sizeof(sCodePunch));
+            net_send(punch, sizeof(punch), &sCodePunch);
             last = now;
         }
         if (sMode == 2 && now - last > 100000000ull) {
             uint32_t hello[3 + NAME_LEN / 4] = {MAGIC, T_HELLO, NET_VERSION};
             memcpy(&hello[3], sMyName, NAME_LEN);
-            sendto(sSock, (const char *)hello, sizeof(hello), 0, (struct sockaddr *)&sPeer, sizeof(sPeer));
+            net_send(hello, sizeof(hello), &sPeer);
             last = now;
         }
         receive();
@@ -509,7 +558,7 @@ static void net_start(int role, const char *host, const char *join) {
             if (now - lastCfg >= 50000000ull) {
                 uint32_t cfg[6 + NAME_LEN / 4] = {MAGIC, T_CONFIG, (uint32_t)sDelay, (uint32_t)sRollMax, NET_VERSION, sRules};
                 memcpy(&cfg[6], sMyName, NAME_LEN);
-                sendto(sSock, (const char *)cfg, sizeof(cfg), 0, (struct sockaddr *)&sPeer, sizeof(sPeer));
+                net_send(cfg, sizeof(cfg), &sPeer);
                 lastCfg = now;
             }
             receive();
@@ -973,6 +1022,7 @@ void Port_NetSessionBegin(int role, const char *address, int port) {
 }
 
 void Port_NetSessionEnd(void) {
+    Relay_Close(sSock);
     if (sSock >= 0) {
         closesocket(sSock);
         sSock = -1;
@@ -999,7 +1049,7 @@ void Port_NetLeave(void) {
         uint32_t bye[2] = {MAGIC, T_BYE};
         int k;
         for (k = 0; k < 3; k++) {
-            sendto(sSock, (const char *)bye, sizeof(bye), 0, (struct sockaddr *)&sPeer, sizeof(sPeer));
+            net_send(bye, sizeof(bye), &sPeer);
         }
     }
     if (Port_SessionCan()) {
@@ -1019,6 +1069,10 @@ static uint64_t sLobbyLast;
    greetings go to every one of those addresses, and the host sends its own packets there too, so that both routers
    let the other side in. -3: the service said no (Port_LobbyError); -4: the two could not reach each other. */
 static int sCodeMode, sCodeAddrs;
+static int sCodeRelay = -1; /* which of sCodeAddr is the host's relay address (the one who joins) */
+static int sCodeVia;        /* the match was reached through the relay (for the window) */
+
+int Port_LobbyRelayed(void) { return sCodeVia; }
 static struct sockaddr_in sCodeAddr[MATCH_ADDRS];
 static char sCodeText[8], sCodeError[96];
 static uint64_t sCodeSince;
@@ -1029,6 +1083,10 @@ const char *Port_LobbyError(void) { return sCodeError; }
 int Port_LobbyStart(int host, const char *address, int port) {
     struct sockaddr_in local;
 
+    if (sHandSock >= 0) { /* (a session that was asked for and never began) */
+        closesocket(sHandSock);
+        sHandSock = -1;
+    }
     if (sSock >= 0) {
         closesocket(sSock);
     }
@@ -1096,6 +1154,8 @@ int Port_LobbyStartCode(int host, const char *code) {
     sCodeLocalPort = ntohs(local.sin_port);
     sLobbyPort = sCodeLocalPort;
     sLobby = 3;
+    Relay_Close(-1);
+    sCodeVia = 0;
     Match_Begin(sLobbyRole, sSock, sCodeLocalPort, code, sMyName, NET_VERSION);
     return sLobby;
 }
@@ -1105,6 +1165,7 @@ void Port_LobbyCancel(void) {
         Match_Cancel();
         sCodeMode = 0;
     }
+    Relay_Close(sSock);
     if (sSock >= 0) {
         closesocket(sSock);
         sSock = -1;
@@ -1114,9 +1175,8 @@ void Port_LobbyCancel(void) {
 
 /* 0 idle, 1 still waiting, 2 the other player is there, -1 it cannot work (port in use, unknown address). */
 int Port_LobbyPoll(void) {
-    uint8_t pkt[64];
+    uint8_t pkt[256];
     struct sockaddr_in from;
-    socklen_t fromLen = sizeof(from);
     uint64_t now = SDL_GetTicksNS();
     int n;
 
@@ -1124,24 +1184,42 @@ int Port_LobbyPoll(void) {
         MatchStatus st;
         int i;
         Match_Poll(&st);
+        if (st.state == 2) {
+            Relay_Tick(sSock); /* (the relay address is kept while the room waits; the thread is done with the socket) */
+        }
         snprintf(sCodeText, sizeof(sCodeText), "%s", st.code);
         if (st.state == -1) {
             snprintf(sCodeError, sizeof(sCodeError), "%s", st.error);
             sLobby = -3;
         } else if (st.state == 3) {
             sCodeAddrs = 0;
+            sCodeRelay = -1;
             for (i = 0; i < st.peerCount && sCodeAddrs < MATCH_ADDRS; i++) {
                 char text[64], *colon;
-                snprintf(text, sizeof(text), "%s", st.peerAddr[i]);
+                const char *addr = st.peerAddr[i];
+                struct sockaddr_in *a = &sCodeAddr[sCodeAddrs];
+                memset(a, 0, sizeof(*a));
+                a->sin_family = AF_INET;
+                if (strncmp(addr, "seen=", 5) == 0) { /* the address the service saw the other player under: for the relay only */
+                    if (inet_pton(AF_INET, addr + 5, &a->sin_addr) == 1) {
+                        Relay_Permit(sSock, a);
+                    }
+                    continue;
+                }
+                if (strncmp(addr, "relay=", 6) == 0) { /* the host's relay address: tried when the direct ones stay silent */
+                    addr += 6;
+                    sCodeRelay = sCodeAddrs;
+                }
+                snprintf(text, sizeof(text), "%s", addr);
                 colon = strrchr(text, ':');
                 if (colon != NULL) {
-                    struct sockaddr_in *a = &sCodeAddr[sCodeAddrs];
                     *colon = '\0';
-                    memset(a, 0, sizeof(*a));
-                    a->sin_family = AF_INET;
                     a->sin_port = htons((uint16_t)atoi(colon + 1));
                     if (inet_pton(AF_INET, text, &a->sin_addr) == 1 && a->sin_port != 0) {
+                        Relay_Permit(sSock, a); /* (the host, if it holds a relay address: this player may come in through it) */
                         sCodeAddrs++;
+                    } else if (sCodeRelay == sCodeAddrs) {
+                        sCodeRelay = -1;
                     }
                 }
             }
@@ -1158,10 +1236,13 @@ int Port_LobbyPoll(void) {
         uint32_t hello[3] = {MAGIC, T_HELLO, NET_VERSION}, punch[2] = {MAGIC, T_PUNCH};
         int i;
         for (i = 0; i < sCodeAddrs; i++) {
+            if (i == sCodeRelay ? now - sCodeSince < 3000000000ull && getenv("BT3_RELAY_ONLY") == NULL : sCodeRelay >= 0 && getenv("BT3_RELAY_ONLY") != NULL) {
+                continue; /* three seconds for the direct ways first (BT3_RELAY_ONLY: the relay at once, and nothing else) */
+            }
             if (sLobbyRole == 2) {
-                sendto(sSock, (const char *)hello, sizeof(hello), 0, (struct sockaddr *)&sCodeAddr[i], sizeof(sCodeAddr[i]));
+                net_send(hello, sizeof(hello), &sCodeAddr[i]);
             } else {
-                sendto(sSock, (const char *)punch, sizeof(punch), 0, (struct sockaddr *)&sCodeAddr[i], sizeof(sCodeAddr[i]));
+                net_send(punch, sizeof(punch), &sCodeAddr[i]);
             }
         }
         sLobbyLast = now;
@@ -1171,10 +1252,10 @@ int Port_LobbyPoll(void) {
         }
     } else if (!sCodeMode && sLobbyRole == 2 && now - sLobbyLast > 200000000ull) {
         uint32_t hello[3] = {MAGIC, T_HELLO, NET_VERSION};
-        sendto(sSock, (const char *)hello, sizeof(hello), 0, (struct sockaddr *)&sPeer, sizeof(sPeer));
+        net_send(hello, sizeof(hello), &sPeer);
         sLobbyLast = now;
     }
-    while ((n = (int)recvfrom(sSock, (char *)pkt, sizeof(pkt), 0, (struct sockaddr *)&from, &fromLen)) >= 8) {
+    while ((n = net_recv(pkt, (int)sizeof(pkt), &from)) >= 8) {
         uint32_t magic, type;
         memcpy(&magic, pkt, 4);
         memcpy(&type, pkt + 4, 4);
@@ -1187,11 +1268,12 @@ int Port_LobbyPoll(void) {
             uint32_t ack[3] = {MAGIC, T_HELLO_ACK, NET_VERSION};
             int k;
             for (k = 0; k < 3; k++) {
-                sendto(sSock, (const char *)ack, sizeof(ack), 0, (struct sockaddr *)&from, sizeof(from));
+                net_send(ack, sizeof(ack), &from);
             }
             if (sCodeMode) { /* where the session goes on knocking, so that the greeting of the session gets in */
                 sCodePunch = from;
                 sCodePunchSet = 1;
+                sCodeVia = Relay_IsPeer(&from);
             }
             sLobby = 2;
         } else if (sLobbyRole == 2 && type == T_HELLO_ACK) {
@@ -1199,15 +1281,52 @@ int Port_LobbyPoll(void) {
             if (sCodeMode && sLobby == 2) { /* the address that answered is the one the session joins */
                 inet_ntop(AF_INET, &from.sin_addr, sLobbyAddr, sizeof(sLobbyAddr));
                 sLobbyPort = ntohs(from.sin_port);
+                sCodeVia = sCodeRelay >= 0 && from.sin_addr.s_addr == sCodeAddr[sCodeRelay].sin_addr.s_addr && from.sin_port == sCodeAddr[sCodeRelay].sin_port;
             }
         }
     }
     return sLobby;
 }
 
+void Port_LobbyLaunch(void);
+
+/* BT3_LOBBY=host or BT3_LOBBY=join:CODE: the room-code lobby driven without its window, once a blank (tests; the
+   code and each change of state are written to the log). BT3_RELAY_ONLY=1: the one who joins tries nothing but the
+   host's relay address. */
+void Port_LobbyAuto(void) {
+    static int state = -99, begun, coded;
+    const char *what = getenv("BT3_LOBBY");
+    int now;
+
+    if (what == NULL || begun == 2 || Port_NetSession()) {
+        return;
+    }
+    if (!begun) {
+        begun = 1;
+        Port_LobbyStartCode(strncmp(what, "join:", 5) != 0, strncmp(what, "join:", 5) == 0 ? what + 5 : "");
+    }
+    now = Port_LobbyPoll();
+    if (now != state || (!coded && Port_LobbyCode()[0] != '\0')) {
+        state = now;
+        coded = Port_LobbyCode()[0] != '\0';
+        fprintf(stderr, "bt3: lobby: state %d, code '%s'%s%s\n", now, Port_LobbyCode(), now == -3 ? ", " : "", now == -3 ? Port_LobbyError() : "");
+    }
+    if (now == 2) {
+        fprintf(stderr, "bt3: lobby: the other player is there (%s)\n", Port_LobbyRelayed() ? "through the relay" : "directly");
+        begun = 2;
+        Port_LobbyLaunch();
+    } else if (now < 0) {
+        begun = 2;
+    }
+}
+
 /* The other player is there: start the session. */
 void Port_LobbyLaunch(void) {
-    closesocket(sSock);
+    if (sCodeMode && Port_SessionCan()) {
+        sHandSock = sSock; /* the session goes on with this socket (see sHandSock) */
+    } else {
+        closesocket(sSock);
+    }
     sSock = -1;
     sLobby = 0;
     if (sCodeMode) {

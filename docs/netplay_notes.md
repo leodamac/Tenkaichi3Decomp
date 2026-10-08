@@ -811,3 +811,62 @@ pacing (the two copies kept in step) as the suspect. The meter is there to see i
   on both copies in every run.
 - Not done: the ping shown in the lobby before the match; changing the delay during a match when the line
   changes; the measurement is the host's only.
+
+## Room codes and a relay (2026-10-09, branch matchmaking)
+
+The aim: a match without port forwarding. Three parts, all checked against the real services.
+
+**The service** (`port/matchmaking`, a Cloudflare Worker with a D1 table): the host posts its name and addresses and
+gets a six-character code; the one who joins posts the code and gets the host's addresses, and the host, asking
+every two seconds, gets the joiner's. Rooms last ten minutes and are given up as soon as both are known. The
+game speaks to it with the system's HTTPS (WinHTTP on Windows; the curl library, loaded when needed, on Linux; the
+`curl` program if neither is there), on a thread (`net_match.c`).
+
+**The addresses** a game posts: what a STUN server sees (`stun.cloudflare.com`, then Google's), asked from the very
+socket the match will use, and the local network address with that socket's port. Both sides then send to every
+address of the other every 200 ms (the joiner its greeting, the host an empty "knock", `T_PUNCH`): a router lets a
+packet in from where one has just gone out to. The address that answers is the one the match uses.
+
+**The relay** (`net_relay.c`), for pairs whose routers do not allow that. Only the host uses it: it asks Cloudflare's
+TURN service for a relayed address and posts it with its others (`relay=ip:port`); for the joiner it is one more
+address, tried when the direct ones have been silent for three seconds. What arrives there reaches the host
+wrapped in a "data indication", and the host's packets to that player go out wrapped in a "send indication" (36
+bytes more each). `net.c` sends and receives every packet through `net_send` / `net_recv`, which do the wrapping.
+The login for the TURN service is made by the Worker for each room (the key stays in the Worker's secrets) and is
+good for three hours. The client is written here (RFC 5766 over UDP: Allocate with the long-term login,
+CreatePermission, Refresh, Send and Data indications; MD5 and HMAC-SHA1 for the login) rather than taken from a
+library: with one side only and no negotiation it is about 450 lines.
+
+Verified:
+- The Worker's whole sequence by hand (host, poll, join, wrong version, full room, wrong key, leave).
+- The matchmaking client alone, two processes: each learns the other's public and local address. The Windows build
+  of it under Wine reaches the Worker through WinHTTP.
+- The relay client alone against Cloudflare: a packet sent to the relayed address from another socket arrives
+  wrapped, the answer goes back through the relay; 40 more of two sizes, with the host's socket opened again in
+  between.
+- Two copies of the 64-bit game on one machine, without windows (`BT3_LOBBY=host`, `BT3_LOBBY=join:CODE`): a room
+  code through the real Worker, then a match; with `BT3_RELAY_ONLY=1` (the joiner tries nothing but the relay
+  address) the match runs through Cloudflare's relay. Whole-state checksums equal on every blank compared
+  (about 2,700 a run), three runs through the relay and two direct; round trip through the relay 18 ms here.
+
+Found on the way:
+- **The socket must not be closed between the lobby and the match.** The lobby used to close its socket and the
+  session opened a new one on the same port. For those 20 ms the other side's packets met a closed port, the
+  system answered "port unreachable", and Cloudflare's relay then passed nothing more from that player: the
+  lobby connected through the relay and the match never began. The lobby's socket is now handed to the session
+  (`sHandSock`); greetings and answers of the lobby that are still in it are recognised by their length.
+- **Cloudflare's TURN service sometimes answers nothing at all to one conversation** (every request from one local
+  port, six in a row) while another port gets through at once; about one in ten here, on port 3478 and on 53. The
+  Allocate is therefore tried on the other port after two silent requests. An answer can also be lost in the
+  middle: a request that got no answer is sent again unchanged (same transaction number), so that the server
+  repeats its answer; with a new number the second request was refused as "437, an address is held already"
+  and the address given in the lost answer was never learned. A 437 is now answered by giving the address up and
+  asking anew.
+- A relay request with an address of a private network is refused (403); harmless, the public one is accepted.
+- `xor_addr(attr_find(..., &len), len, ...)` read `len` before it was set: the same order-of-evaluation trap the
+  bug search had listed in the game's own code.
+
+Not verified: two machines on two networks (the direct way through two real routers, and the relay where it is
+needed); real Windows (WinHTTP there, and the relay code's Windows build has only been compiled); a session
+longer than the login's three hours; the 32-bit build, which restarts the program for a session and so loses the
+relay address (it still connects directly).

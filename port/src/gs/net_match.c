@@ -30,6 +30,7 @@
 
 #define MATCH_URL_DEFAULT "https://odd-surf-0af7.bt3decomp.workers.dev"
 #include "net_match.h"
+#include "net_relay.h"
 
 static struct {
     SDL_Mutex *lock;
@@ -383,14 +384,33 @@ static int SDLCALL match_thread(void *arg) {
         if (STOPPED()) {
             return 0;
         }
-        SDL_LockMutex(sM.lock);
-        if (!json_str(answer, "code", sM.st.code, sizeof(sM.st.code)) || !json_str(answer, "key", key, sizeof(key))) {
-            SDL_UnlockMutex(sM.lock);
+        if (!json_str(answer, "code", sM.code, sizeof(sM.code)) || !json_str(answer, "key", key, sizeof(key))) {
             set_state(-1, SDL_strstr(answer, "busy") != NULL ? "Too many rooms from this address; try again in a few minutes." : "The matchmaking service gave no room.");
             return 0;
         }
+        {
+            /* A relay address, if the service gives access to one: published with the others, for a player who
+               cannot reach this one directly. The code is shown only after this, so nobody joins before. */
+            char server[128], user[160], pass[160], relay[64];
+            if (SDL_getenv("BT3_RELAY_LOG") != NULL) {
+                char why[160] = "";
+                json_str(answer, "noRelay", why, sizeof(why));
+                fprintf(stderr, "relay: the service %s%s\n", SDL_strstr(answer, "\"turn\"") != NULL ? "gave access" : "gave no access: ", why);
+            }
+            if (SDL_getenv("BT3_NO_RELAY") == NULL && json_str(answer, "server", server, sizeof(server)) && json_str(answer, "username", user, sizeof(user)) &&
+                json_str(answer, "credential", pass, sizeof(pass)) && Relay_Allocate(sM.sock, server, user, pass, relay, sizeof(relay)) && !STOPPED()) {
+                SDL_snprintf(body, sizeof(body), "{\"code\":\"%s\",\"key\":\"%s\",\"addrs\":[%s,\"relay=%s\"]}", sM.code, key, addrs, relay);
+                http_post("addrs", body, answer, sizeof(answer));
+            }
+        }
+        if (STOPPED()) {
+            SDL_snprintf(body, sizeof(body), "{\"code\":\"%s\",\"key\":\"%s\"}", sM.code, key);
+            http_post("leave", body, answer, sizeof(answer));
+            return 0;
+        }
+        SDL_LockMutex(sM.lock);
+        SDL_strlcpy(sM.st.code, sM.code, sizeof(sM.st.code)); /* (shown from here on) */
         sM.st.state = 2;
-        SDL_strlcpy(sM.code, sM.st.code, sizeof(sM.code));
         SDL_UnlockMutex(sM.lock);
         SDL_snprintf(body, sizeof(body), "{\"code\":\"%s\",\"key\":\"%s\"}", sM.code, key);
         for (i = 0; i < 290 && !STOPPED(); i++) { /* a room lasts ten minutes */

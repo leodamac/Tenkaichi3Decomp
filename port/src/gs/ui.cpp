@@ -48,6 +48,7 @@ int Port_LobbyStart(int host, const char *address, int port); // gs/net.c
 int Port_LobbyStartCode(int host, const char *code);         // the same with a room code (the matchmaking service)
 const char *Port_LobbyCode(void);                            // the host's room code, "" until it is known
 const char *Port_LobbyError(void);                           // why the matchmaking failed (state -3)
+int Port_LobbyRelayed(void);                                 // the other player was reached through the relay
 int Port_LobbyPoll(void);
 void Port_LobbyCancel(void);
 void Port_LobbyLaunch(void);
@@ -429,7 +430,7 @@ static void build_net(void) {
                 if (lastState == -3) {
                     ImGui::TextWrapped("%s", Port_LobbyError());
                 } else if (lastState == -4) {
-                    ImGui::TextWrapped("The two games could not reach each other directly: some routers and mobile connections do not allow it. "
+                    ImGui::TextWrapped("The two games could not reach each other, directly or through the relay. "
                                        "Hosting on a port (with port forwarding or a virtual network such as Tailscale) still works.");
                 }
                 bool can = byCode ? (tab == 0 || strlen(roomCode) == 6) : atoi(port) > 0 && (tab == 0 || address[0] != '\0');

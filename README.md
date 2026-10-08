@@ -34,7 +34,8 @@ game's data from it, and it stays on your computer.
   developers left in: all characters, stages, music, items and Zenni).
 
 - **Online play, experimental** (from release 0.1.8): the main menu's hidden "Dragon Net Battle"
-  entry is back and opens a small window. One player hosts on a port, the other joins with the host's address;
+  entry is back and opens a small window. One player hosts and gets a six-character room code, the other joins
+  with the code: no port forwarding (hosting on a port and joining by address is still there);
   both get the same roster with everything unlocked, each sees their own fighter's view full screen, and leaving
   the match puts each player back where they were with their own save. Linux and Windows play against each
   other. With rollback (the host chooses how many frames, and the input delay) your own moves come out at once
@@ -46,11 +47,16 @@ game's data from it, and it stays on your computer.
 Online play is new. It has been played over the internet between a Linux and a Windows machine. The input delay
 is chosen from the connection when a match starts (or set by the host), both players need the same release (the
 game says so when they differ; 0.1.10 does not play against 0.1.8 / 0.1.9, and 0.1.15 does not play against
-0.1.14 and earlier), and the host's port has to be
-reachable from the other player (port forwarding, or a virtual network such as Tailscale; there is no relay or
-match-making). F1, Video has a meter for the frame rate and, in a match, the ping, rollbacks and waits. The 32-bit
+0.1.14 and earlier). F1, Video has a meter for the frame rate and, in a match, the ping, rollbacks and waits. The 32-bit
 Linux build has no rollback. [docs/netplay_notes.md](docs/netplay_notes.md) is the working log of how it is built
 and what was checked.
+
+Room codes go through a small matchmaking service (a Cloudflare Worker; its whole source is in
+[port/matchmaking](port/matchmaking), and `BT3_MATCH_URL` points the game at another copy of it). The game tells it
+the name typed in the window and the addresses it can be reached at; the service keeps them with the room for at
+most ten minutes and hands them to the player who enters the code. The two games then send to each other
+directly. Where the routers do not allow that, the match goes through a relay (Cloudflare's TURN service), which
+passes the match's packets (the buttons pressed) on and keeps nothing. Without a room code none of this is used.
 
 See [docs/port/README.md](docs/port/README.md) for the running log of what is done, what is verified and what is not.
 

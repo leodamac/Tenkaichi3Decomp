@@ -155,6 +155,10 @@ void Port_VBlank(void) {
                                                begins or ends here */
         Port_SessionPoll();
     }
+    {
+        extern void Port_LobbyAuto(void); /* gs/net.c: BT3_LOBBY, the room-code lobby without its window (tests) */
+        Port_LobbyAuto();
+    }
     /* BT3_PACED=1: real-time pacing without a window too (sound tests) */
     {
         extern int Port_NetSession(void), Port_NetWarp(void); /* gs/net.c */
