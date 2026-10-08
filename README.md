@@ -14,6 +14,11 @@ game's data from it, and it stays on your computer.
   An OpenGL 3.3 renderer draws the same picture for machines without a working Vulkan (F1, Video, Renderer; it
   is also tried by itself when Vulkan cannot start). It is slower than Vulkan.
 - Internal resolution from 1x to 8x; 4:3, 16:9, 21:9 and wider without stretching the fight.
+- Smooth motion (experimental, off by default; F1, Video, or F9): the game computes a fight 30 times a second, as
+  on the console; with this the renderer draws pictures in between, for 60, 120 or 240 a second. The fight itself,
+  replays and online play are unchanged, and the two players of an online match need not agree on it. The newest
+  picture reaches the screen 17 to 29 ms later than without. Known limits: pictures are left out at camera cuts
+  and where the camera would pass through scenery; 240 is uneven; little tested with OpenGL.
 - Music, voices and sound effects; keyboard and controllers, fully rebindable; two players.
 - Texture packs made for PCSX2 (`.dds` or `.png`): copied into the `textures` folder next to the game, they are used as they are.
 - Stages and music from outside the disc: a stage model (`.unk`) dropped into the `stages` folder next to the
