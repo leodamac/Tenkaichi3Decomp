@@ -169,13 +169,15 @@ void Port_VBlank(void) {
             /* gs/gs_draw.c: the pictures of the tick that follow its first (in-between pictures and the real one):
                those due before this blank now, those due at it after the wait */
             extern void GsGpu_InterpPump(int ahead_ms, int all);
-            if (GsGpu_Enabled()) {
+            /* (not while blanks are run again after a rollback or run ahead for an online session: those are
+               not shown and not timed, and waiting for a picture here would slow the catching up) */
+            if (GsGpu_Enabled() && !warp && !again) {
                 GsGpu_InterpPump(-1, 0); /* (-1: what can be finished before the blank) */
             }
             if ((GsGpu_Enabled() || getenv("BT3_PACED") != NULL) && getenv("BT3_UNCAPPED") == NULL && !warp && !again) {
                 vblank_wait();
             }
-            if (GsGpu_Enabled()) {
+            if (GsGpu_Enabled() && !warp && !again) {
                 GsGpu_InterpPump(6, 0);
             }
         }
