@@ -534,9 +534,18 @@ static int own_voice_alt(void) {
 }
 
 /* Whether this copy plays the second voice set in the online match it is in (the player's own choice, above). */
+static int sVoiceAlt = -1; /* 1 the second set, 0 the default; -1 not decided (then BT3_NET_VOICE says, once) */
+
 int Port_NetVoiceAlt(void) {
-    const char *v = getenv("BT3_NET_VOICE");
-    return Port_NetActive() && v != NULL && strcmp(v, "alt") == 0;
+    /* (Not asked of the environment every time: the port's getenv remembers its first answer at each place it is
+       called from (gs_internal.h), and a match that begins without the program starting again sets the variable
+       after that first look. Found on Windows, 2026-10-09: the choice was never seen. The match's start sets
+       sVoiceAlt itself; the variable is for the program that starts again as the session, and for tests.) */
+    if (sVoiceAlt < 0) {
+        const char *v = getenv("BT3_NET_VOICE");
+        sVoiceAlt = v != NULL && strcmp(v, "alt") == 0;
+    }
+    return Port_NetActive() && sVoiceAlt == 1;
 }
 
 /* The players' names (the lobby window's "Player name"), for the line under each side's gauges: this copy's own
@@ -907,7 +916,7 @@ void Port_NetSessionBegin(int role, const char *address, int port) {
     remove("net_session/card1/BASLUS-21678DBZT3/BASLUS-21678DBZT3");
     remove("net_session/card1/BASLUS-21678DBZT3/icon.sys");
     remove("net_session/card1/BASLUS-21678DBZT3/dbzsm.ico");
-    put_env("BT3_NET_VOICE", own_voice_alt() ? "alt" : "default");
+    sVoiceAlt = own_voice_alt(); /* (before the save folder changes: it is read from the player's own) */
     put_env("BT3_SAVES", "net_session");
     snprintf(host, sizeof(host), "%d", port);
     snprintf(join, sizeof(join), "%s:%d", address, port);
