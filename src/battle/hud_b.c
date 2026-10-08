@@ -872,7 +872,7 @@ void HudGauge_ClearFaceTexMark(void) {
         if (gHudGauge->faceRes[i] != NULL) {
             HudBTex *tex = gHudGauge->faceRes[i]->tex;
 
-            tex += i;
+            tex += HUD_SCR(i);
             tex->mark = 0;
         }
     }
@@ -888,7 +888,9 @@ void HudGauge_DrawFace(HudBGroup *node) {
         HudGauge_ClearFaceTexMark();
         for (i = 0; i < node->sprCount; i++) {
             spr = node->sprList[i];
-            HudSprite_InitTex(spr, gHudGauge->faceRes[gHudGauge->side], gHudGauge->side, 0);
+            /* (PC build: a fighter's face sheet has two pictures, one drawn for the left place and one for the right;
+               with the sides swapped the picture is the one of the place, not of the side) */
+            HudSprite_InitTex(spr, gHudGauge->faceRes[gHudGauge->side], HUD_SCR(gHudGauge->side), 0);
             if (BtlCtrl_GetObj(gHudGauge->side)->unkA40 & 0x40000) {
                 HudSprite_SetColor(spr, 0x80, 0x50, 0x70, 0x80);
             } else {
