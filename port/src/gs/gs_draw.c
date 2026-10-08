@@ -1284,6 +1284,7 @@ int GsGpu_Init(void) {
  * would jump far on screen (a camera cut, a teleport) is not blended, and when most are like that no in-between
  * picture is shown at all. */
 int gsInterp = -1;
+static uint32_t sInterpBlkView[MAX_VU_UNIFORMS], sInterpPrevBlkView[MAX_VU_UNIFORMS]; /* the view each block is drawn in (a number made of its draws' scissor rectangle) */
 static float sInterpPrevRep[MAX_VU_UNIFORMS][3];
 static uint8_t sInterpFollow[MAX_VU_UNIFORMS]; /* the block is scenery that goes with the camera (the far backdrop) */
 static double sInterpCamNow[3], sInterpCamWas[3]; /* where the camera stands, this picture and the previous one */
@@ -1312,6 +1313,7 @@ static unsigned gInterpCuts, gInterpStatic, gInterpNotMutual;
 static unsigned gInterpFollowed, gInterpThrough; /* ticks left without in-between pictures because the camera's way crossed the scenery */
 static unsigned gInterpPaired, gInterpUnpaired, gInterpCamera; /* blocks blended / without a partner / of those, moved by the camera's change (BT3_INTERP_LOG) */
 
+#define INTERP_SCISSOR_ID(d) ((((uint32_t)(d)->scissor[0] * 73856093u) ^ ((uint32_t)(d)->scissor[1] * 19349663u) ^ ((uint32_t)(d)->scissor[2] * 83492791u) ^ ((uint32_t)(d)->scissor[3] * 2971215073u)) | 1u)
 /* What a uniform block draws, as a number that is the same in the next picture: the kind of each of its draws and
    the first vertices of each (they are in model space: the same mesh has the same numbers every frame, wherever it
    stands in the list; the stage's pieces come and go with what the camera sees, so the place in the list is no
@@ -1338,6 +1340,7 @@ static void interp_signatures(uint32_t *sig) {
             }
             sig[d->uniform] = (sig[d->uniform] * 31u + h) | 1u;
             sInterpKind[d->uniform] = (uint16_t)(d->vu * 64 + ((int)gsVuUni[d->uniform].misc[3] & 63));
+            sInterpBlkView[d->uniform] = INTERP_SCISSOR_ID(d);
             if (d->vu == 3) {
                 /* The ground under a fighter that carries its shadow (vertex program 6): its vertices are the piece
                    of ground the fighter stands over, new numbers every picture, so the vertices are no identity.
@@ -1591,19 +1594,19 @@ static void interp_bone(const float *p, const float *c, float t, int around, flo
     }
 }
 
+/* (of the view being worked on: interp_build_view) */
+static uint32_t jumped, nscreens;
+static float D[16];
+static const float *screens[16];
+static int agreed, bonesInView;
+static uint32_t sInterpView; /* the view being worked on: the scissor id of its draws */
+static int sInterpWasCut;
 #define INTERP_CUT 300.0f /* GS pixels the scenery may move in a tick by the camera alone; more is a cut */
 
-static int interp_build(float t, int first) {
+static int interp_build_view(float t, int first) {
     uint32_t i, paired = 0;
-    static uint32_t jumped, nscreens;
-    static float D[16];
     float inv[16], chk[16];
-    static const float *screens[16];
-    static int agreed, bonesInView;
 
-    if (gsVuUniCount == 0 || sInterpPrevCount == 0) {
-        return 0;
-    }
     if (!first) {
         goto blend; /* (who goes with whom and how the camera moved was worked out for the tick's first picture) */
     }
@@ -1618,6 +1621,7 @@ static int interp_build(float t, int first) {
     }
     /* 1. Each block's partner: the block of the previous picture that draws the same mesh. */
     for (i = 0; i < gsVuUniCount; i++) {
+        if (sInterpBlkView[i] != sInterpView) { continue; } /* (one view at a time) */
         const Vu0Uniform *c = &gsVuUni[i];
         const float *cf = (const float *)c;
         float bestDist = 0.0f, bestDist2 = 0.0f;
@@ -1632,7 +1636,7 @@ static int interp_build(float t, int first) {
         for (j = sInterpBucket[sInterpSig[i] * 2654435761u >> 20]; j != 0xFFFF; j = sInterpChain[j]) {
             /* (a shadow's strips are several blocks with one fighter's matrices, and their number changes with
                the ground: each takes the nearest of the previous picture, used before or not) */
-            if (sInterpPrevSig[j] == sInterpSig[i] && (!sInterpUsed[j] || sInterpSig[i] == 0x53484457u)) {
+            if (sInterpPrevSig[j] == sInterpSig[i] && sInterpPrevBlkView[j] == sInterpView && (!sInterpUsed[j] || sInterpSig[i] == 0x53484457u)) {
                 /* Nearest first by where the mesh stands (bones and pivots), and only among equals by the screen
                    matrix. One sum over both let the camera decide: the sky is the same slice of a dome many times
                    over, and while the camera turned, the slice NEXT to a slice had the nearer screen matrix. */
@@ -1676,6 +1680,7 @@ static int interp_build(float t, int first) {
             sInterpBucket2[h] = (uint16_t)i;
         }
         for (i = 0; i < gsVuUniCount; i++) {
+        if (sInterpBlkView[i] != sInterpView) { continue; } /* (one view at a time) */
             const Vu0Uniform *c = &gsVuUni[i];
             const uint32_t *w = (const uint32_t *)c->boneA;
             const float *cf = (const float *)c;
@@ -1692,7 +1697,7 @@ static int interp_build(float t, int first) {
                 h = (h ^ w[k2]) * 16777619u;
             }
             for (j = sInterpBucket2[h * 2654435761u >> 20]; j != 0xFFFF; j = sInterpChain2[j]) {
-                if (sInterpPrevKind[j] == sInterpKind[i] && memcmp(sInterpPrev[j].boneA, c->boneA, 40 * sizeof(float)) == 0) {
+                if (sInterpPrevKind[j] == sInterpKind[i] && sInterpPrevBlkView[j] == sInterpView && memcmp(sInterpPrev[j].boneA, c->boneA, 40 * sizeof(float)) == 0) {
                     best = j;
                     break;
                 }
@@ -1704,7 +1709,7 @@ static int interp_build(float t, int first) {
                 for (j2 = 0; j2 < sInterpPrevCount; j2++) {
                     const float *pf = (const float *)&sInterpPrev[j2];
                     float dist = 0.0f;
-                    if (sInterpUsed[j2] || sInterpPrevKind[j2] != sInterpKind[i]) {
+                    if (sInterpUsed[j2] || sInterpPrevKind[j2] != sInterpKind[i] || sInterpPrevBlkView[j2] != sInterpView) {
                         continue;
                     }
                     for (k2 = 0; k2 < 40 && dist <= mag * 0.05f; k2++) {
@@ -1742,6 +1747,7 @@ static int interp_build(float t, int first) {
         uint32_t a, b;
 
         for (a = 0; a < gsVuUniCount && !agreed && tries < 8; a++) {
+        if (sInterpBlkView[a] != sInterpView) { continue; } /* (one view at a time) */
             const Vu0Uniform *c = &gsVuUni[a], *q;
             if (sInterpPair[a] < 0) {
                 continue;
@@ -1753,6 +1759,7 @@ static int interp_build(float t, int first) {
             interp_mul(q->screen, inv, D);
             tries++;
             for (b = a + 1; b < gsVuUniCount; b++) {
+        if (sInterpBlkView[b] != sInterpView) { continue; } /* (one view at a time) */
                 const Vu0Uniform *c2 = &gsVuUni[b], *q2;
                 float err = 0.0f, mag = 0.0f;
                 int k;
@@ -1824,6 +1831,7 @@ static int interp_build(float t, int first) {
         d[2] = (float)(sInterpCamNow[2] - sInterpCamWas[2]);
         dl = fabsf(d[0]) + fabsf(d[1]) + fabsf(d[2]);
         for (i = 0; i < gsVuUniCount && dl > 1e-4f; i++) {
+        if (sInterpBlkView[i] != sInterpView) { continue; } /* (one view at a time) */
             uint32_t j2;
             const float *r = sInterpRep[i];
             if (sInterpPair[i] >= 0 || sInterpSig[i] == 0 || (sInterpKind[i] >> 6) != 2) {
@@ -1844,7 +1852,7 @@ static int interp_build(float t, int first) {
             for (j2 = 0; j2 < sInterpPrevCount; j2++) {
                 const float *q = sInterpPrevRep[j2];
                 float e;
-                if (sInterpUsed[j2] || sInterpPrevKind[j2] != sInterpKind[i]) {
+                if (sInterpUsed[j2] || sInterpPrevKind[j2] != sInterpKind[i] || sInterpPrevBlkView[j2] != sInterpView) {
                     continue;
                 }
                 e = fabsf(r[0] - q[0] - d[0]) + fabsf(r[1] - q[1] - d[1]) + fabsf(r[2] - q[2] - d[2]);
@@ -1868,6 +1876,7 @@ static int interp_build(float t, int first) {
         /* how far the camera alone moved the scenery on the screen, typically: the middle of what the still blocks
            in view moved */
         for (i = 0; agreed && i < gsVuUniCount && nmove < 256; i++) {
+        if (sInterpBlkView[i] != sInterpView) { continue; } /* (one view at a time) */
             const Vu0Uniform *c = &gsVuUni[i], *q;
             float sc[4], sp[4];
             if (sInterpPair[i] < 0) {
@@ -1890,7 +1899,7 @@ static int interp_build(float t, int first) {
         if (agreed) {
             uint32_t n2, total = 0, stepV;
             for (n2 = 0; n2 < gsDrawCount; n2++) {
-                total += gsDraws[n2].vu == 2 ? gsDraws[n2].count : 0;
+                total += gsDraws[n2].vu == 2 && gsDraws[n2].uniform >= 0 && (uint32_t)gsDraws[n2].uniform < gsVuUniCount && sInterpBlkView[gsDraws[n2].uniform] == sInterpView ? gsDraws[n2].count : 0;
             }
             stepV = total / 400 ? total / 400 : 1;
             nmove = 0;
@@ -1898,7 +1907,7 @@ static int interp_build(float t, int first) {
                 const GsDraw *d = &gsDraws[n2];
                 const Vu0Uniform *c;
                 uint32_t k2;
-                if (d->vu != 2 || d->uniform < 0 || (uint32_t)d->uniform >= gsVuUniCount) {
+                if (d->vu != 2 || d->uniform < 0 || (uint32_t)d->uniform >= gsVuUniCount || sInterpBlkView[d->uniform] != sInterpView) {
                     continue;
                 }
                 c = &gsVuUni[d->uniform];
@@ -1945,6 +1954,7 @@ static int interp_build(float t, int first) {
         sInterpCamMove = cam;
 
         for (i = 0; i < gsVuUniCount; i++) {
+        if (sInterpBlkView[i] != sInterpView) { continue; } /* (one view at a time) */
             const Vu0Uniform *c = &gsVuUni[i], *q;
             float sc[4], sp[4], pr[4];
             int k, bad = 0;
@@ -2005,6 +2015,7 @@ static int interp_build(float t, int first) {
         if ((still >= 8 ? far * 2 > still || cam > 250.0f : movN >= 6 && movBig * 2 > movN) ||
             (movN >= 6 && movBig * 10 >= movN * 9 && cam > 120.0f)) {
             gInterpCuts++;
+            sInterpWasCut = 1;
             return 0;
         }
     }
@@ -2014,6 +2025,7 @@ static int interp_build(float t, int first) {
     {
         uint32_t same = 0, other = 0;
         for (i = 0; agreed && i < gsVuUniCount; i++) {
+        if (sInterpBlkView[i] != sInterpView) { continue; } /* (one view at a time) */
             const Vu0Uniform *c = &gsVuUni[i], *q;
             if (sInterpPair[i] < 0 || sInterpSig[i] == 0x53484457u || c->misc[3] > 1.0f) {
                 continue;
@@ -2029,6 +2041,7 @@ static int interp_build(float t, int first) {
        the camera's change may be applied to. */
     nscreens = 0;
     for (i = 0; agreed && i < gsVuUniCount && nscreens < 16; i++) {
+        if (sInterpBlkView[i] != sInterpView) { continue; } /* (one view at a time) */
         const Vu0Uniform *c = &gsVuUni[i];
         uint32_t k2;
         if (sInterpPair[i] < 0 || memcmp(c->boneA, sInterpPrev[sInterpPair[i]].boneA, 40 * sizeof(float)) != 0) {
@@ -2061,7 +2074,7 @@ static int interp_build(float t, int first) {
         for (n2 = 0; len > 0.05f && n2 < gsDrawCount && !hit; n2++) {
             const GsDraw *d = &gsDraws[n2];
             uint32_t k2, tri;
-            if (d->vu != 2 || d->uniform < 0 || (uint32_t)d->uniform >= gsVuUniCount) {
+            if (d->vu != 2 || d->uniform < 0 || (uint32_t)d->uniform >= gsVuUniCount || sInterpBlkView[d->uniform] != sInterpView) {
                 continue;
             }
             for (k2 = 0; k2 < nscreens && memcmp(screens[k2], gsVuUni[d->uniform].screen, 64) != 0; k2++) {
@@ -2109,6 +2122,7 @@ static int interp_build(float t, int first) {
         }
         if (hit) {
             gInterpThrough++;
+            sInterpWasCut = 1;
             return 0;
         }
     }
@@ -2141,13 +2155,11 @@ blend:
         }
     }
     for (i = 0; i < gsVuUniCount; i++) {
+        if (sInterpBlkView[i] != sInterpView) { continue; } /* (one view at a time) */
         const Vu0Uniform *c = &gsVuUni[i];
         Vu0Uniform *o = &sInterpBlend[i];
         int k, scenery = 0, part = 0;
 
-        if (!first) {
-            *o = *c;
-        }
         if (agreed) {
             uint32_t k2;
             for (k2 = 0; k2 < nscreens && memcmp(screens[k2], c->screen, 64) != 0; k2++) {
@@ -2307,6 +2319,130 @@ blend:
     return paired != 0 && (agreed || jumped * 2 <= paired);
 }
 
+/* The views of the picture: split screen has two, each with its own camera, and the rendering of a fighter's shadow
+   is one of its own. A view is told by the scissor rectangle its draws are made with. Everything above is done for
+   one view at a time (sInterpView), with what it found about that view's camera kept from the tick's first picture
+   to its later ones. (Done for the picture as a whole, the second view of a split screen was given the first
+   view's camera: none of what depends on the camera worked in it.) */
+#define INTERP_MAX_VIEWS 8
+typedef struct InterpViewState {
+    uint32_t id;
+    int ok, cut, scenery;
+    float D[16], offX, offY, zMax, Dt[16], camMove;
+    double root[3][16], Dd[16], DtD[16], camNow[3], camWas[3], sceneWas[16];
+    int haveD, roots, haveDt, haveCam, agreed, bonesInView;
+    uint32_t jumped, nscreens;
+    const float *screens[16];
+} InterpViewState;
+static InterpViewState sInterpViews[INTERP_MAX_VIEWS];
+static int sInterpViewCount, sInterpViewLoaded = -1;
+
+static void interp_view_save(InterpViewState *v) {
+    memcpy(v->D, D, sizeof(D));
+    v->offX = sInterpOffX; v->offY = sInterpOffY; v->zMax = sInterpZMax; v->camMove = sInterpCamMove;
+    memcpy(v->Dt, sInterpDt, sizeof(v->Dt));
+    memcpy(v->root, sInterpRoot, sizeof(v->root));
+    memcpy(v->Dd, sInterpDd, sizeof(v->Dd));
+    memcpy(v->DtD, sInterpDtD, sizeof(v->DtD));
+    memcpy(v->camNow, sInterpCamNow, sizeof(v->camNow));
+    memcpy(v->camWas, sInterpCamWas, sizeof(v->camWas));
+    memcpy(v->sceneWas, sInterpSceneWas, sizeof(v->sceneWas));
+    v->haveD = sInterpHaveD; v->roots = sInterpRoots; v->haveDt = sInterpHaveDt; v->haveCam = sInterpHaveCam;
+    v->agreed = agreed; v->bonesInView = bonesInView; v->jumped = jumped; v->nscreens = nscreens;
+    memcpy(v->screens, screens, sizeof(v->screens));
+}
+
+static void interp_view_load(const InterpViewState *v) {
+    memcpy(D, v->D, sizeof(D));
+    memcpy(sInterpD, v->D, sizeof(sInterpD));
+    sInterpOffX = v->offX; sInterpOffY = v->offY; sInterpZMax = v->zMax; sInterpCamMove = v->camMove;
+    memcpy(sInterpDt, v->Dt, sizeof(v->Dt));
+    memcpy(sInterpRoot, v->root, sizeof(v->root));
+    memcpy(sInterpDd, v->Dd, sizeof(v->Dd));
+    memcpy(sInterpDtD, v->DtD, sizeof(v->DtD));
+    memcpy(sInterpCamNow, v->camNow, sizeof(v->camNow));
+    memcpy(sInterpCamWas, v->camWas, sizeof(v->camWas));
+    memcpy(sInterpSceneWas, v->sceneWas, sizeof(v->sceneWas));
+    sInterpHaveD = v->haveD; sInterpRoots = v->roots; sInterpHaveDt = v->haveDt; sInterpHaveCam = v->haveCam;
+    agreed = v->agreed; bonesInView = v->bonesInView; jumped = v->jumped; nscreens = v->nscreens;
+    memcpy(screens, v->screens, sizeof(v->screens));
+}
+
+/* For the pieces (interp_build_verts): what is known of the camera of view `id`. 0 = the view has no in-between
+   picture this tick (a cut in it): its pieces stay this picture's. */
+static int interp_view_select(uint32_t id) {
+    int k;
+
+    if (sInterpViewLoaded >= 0 && sInterpViews[sInterpViewLoaded].id == id) {
+        return !sInterpViews[sInterpViewLoaded].cut;
+    }
+    for (k = 0; k < sInterpViewCount; k++) {
+        if (sInterpViews[k].id == id) {
+            interp_view_load(&sInterpViews[k]);
+            sInterpViewLoaded = k;
+            return !sInterpViews[k].cut;
+        }
+    }
+    /* a view without any block of a vertex program (the HUD's rectangle): no camera */
+    sInterpHaveD = sInterpHaveDt = sInterpRoots = sInterpHaveCam = 0;
+    sInterpCamMove = 0.0f;
+    sInterpViewLoaded = -1;
+    return 1;
+}
+
+static int interp_build(float t, int first) {
+    uint32_t i;
+    int k, okAny = 0, cutAny = 0, okScenery = 0;
+
+    if (gsVuUniCount == 0 || sInterpPrevCount == 0) {
+        return 0;
+    }
+    memcpy(sInterpBlend, gsVuUni, gsVuUniCount * sizeof(Vu0Uniform));
+    if (first) {
+        sInterpViewCount = 0;
+        for (i = 0; i < gsVuUniCount; i++) {
+            if (sInterpSig[i] == 0) {
+                continue;
+            }
+            for (k = 0; k < sInterpViewCount && sInterpViews[k].id != sInterpBlkView[i]; k++) {
+            }
+            if (k == sInterpViewCount) {
+                if (sInterpViewCount == INTERP_MAX_VIEWS) {
+                    sInterpBlkView[i] = sInterpViews[0].id; /* (more views than there is room for: with the first) */
+                    k = 0;
+                } else {
+                    memset(&sInterpViews[k], 0, sizeof(sInterpViews[k]));
+                    sInterpViews[k].id = sInterpBlkView[i];
+                    sInterpViewCount++;
+                }
+            }
+            sInterpViews[k].scenery |= (sInterpKind[i] >> 6) == 2;
+        }
+    }
+    for (k = 0; k < sInterpViewCount; k++) {
+        InterpViewState *v = &sInterpViews[k];
+        sInterpView = v->id;
+        if (first) {
+            sInterpWasCut = 0;
+            sInterpHaveD = sInterpHaveDt = sInterpRoots = sInterpHaveCam = 0;
+            sInterpCamMove = 0.0f;
+            v->ok = interp_build_view(t, 1);
+            v->cut = sInterpWasCut;
+            interp_view_save(v);
+        } else if (v->ok) {
+            interp_view_load(v);
+            interp_build_view(t, 0);
+            interp_view_save(v);
+        }
+        okAny |= v->ok;
+        cutAny |= v->cut;
+        okScenery |= v->ok && v->scenery;
+    }
+    sInterpViewLoaded = -1;
+    /* a cut where no view with scenery goes on: no in-between picture at all (the shots of a transformation) */
+    return okAny && !(cutAny && !okScenery);
+}
+
 /* ---- the primitives the game transformed itself (effects, beams, dust, the HUD): Vtx in GS pixels ----
  * They have no matrix to blend, so their vertices are: each triangle of this picture is paired with a triangle of
  * the previous picture that is drawn the same way (texture, pipeline, target) and lies nearest, looked for around
@@ -2317,6 +2453,7 @@ blend:
 typedef struct InterpPrim {
     uint32_t sig, first; /* first: index of its first vertex */
     uint32_t kind;       /* sig without the number of triangles: how it is drawn */
+    uint32_t view;       /* the view it is drawn in (INTERP_SCISSOR_ID) */
     uint8_t flat2d, tris; /* tris: how many triangles the piece has (a quad: 2) */
 } InterpPrim;
 #define INTERP_PIECE_MAX 16 /* triangles of one piece (a longer strip is cut into several) */
@@ -2486,8 +2623,9 @@ static uint32_t interp_prims(InterpPrim *out) {
                 }
                 tris++;
             }
-            out[count].sig = ((uint32_t)d->tex * 2654435761u) ^ ((uint32_t)d->pipeline * 40503u) ^ (role * 0x9E3779B1u) ^ (tris * 0x85EBCA6Bu);
-            out[count].kind = ((uint32_t)d->tex * 2654435761u) ^ ((uint32_t)d->pipeline * 40503u) ^ (role * 0x9E3779B1u);
+            out[count].view = INTERP_SCISSOR_ID(d);
+            out[count].sig = ((uint32_t)d->tex * 2654435761u) ^ ((uint32_t)d->pipeline * 40503u) ^ (role * 0x9E3779B1u) ^ (tris * 0x85EBCA6Bu) ^ (out[count].view * 0xC2B2AE35u);
+            out[count].kind = ((uint32_t)d->tex * 2654435761u) ^ ((uint32_t)d->pipeline * 40503u) ^ (role * 0x9E3779B1u) ^ (out[count].view * 0xC2B2AE35u);
             out[count].first = d->first + k;
             out[count].flat2d = d->misc[3] != 0.0f;
             out[count].tris = (uint8_t)tris;
@@ -2534,7 +2672,7 @@ static void interp_static_kinds(void) {
     uint32_t i, j;
 
     sInterpKindCount = 0;
-    if (!sInterpHaveD || sInterpPrevPrimCount == 0) {
+    if (sInterpPrevPrimCount == 0) {
         return;
     }
     if (sInterpPrevByKind == NULL) {
@@ -2556,6 +2694,9 @@ static void interp_static_kinds(void) {
         int e = interp_kind_find(c->kind, 0), k, nv = c->tris * 3;
         uint32_t stride, a, b;
         if (e < 0 || sInterpKinds[e].flat) {
+            continue;
+        }
+        if (!interp_view_select(c->view) || !sInterpHaveD) { /* (its view's camera; none, or a cut there: not asked) */
             continue;
         }
         stride = sInterpKinds[e].count / 16 + 1;
@@ -2618,6 +2759,11 @@ static void interp_build_verts(float t) {
         while (lo < sInterpPrevPrimCount && sInterpPrevPrims[lo].sig < sig) { lo++; }
         pEnd = lo;
         while (pEnd < sInterpPrevPrimCount && sInterpPrevPrims[pEnd].sig == sig) { pEnd++; }
+        if (!interp_view_select(sInterpPrims[i].view)) { /* a cut in this piece's view: it stays this picture's */
+            i = end;
+            lo = pEnd;
+            continue;
+        }
         gInterpTris += end - i;
         /* Is this kind of piece something that stands still in the world (the translucent wall at the edge of the
            map, drawn as a grid of like tiles; marks on the ground)? Then every piece of it goes by the camera's
@@ -2877,6 +3023,7 @@ static void interp_remember(void) {
     memcpy(sInterpPrev, gsVuUni, gsVuUniCount * sizeof(Vu0Uniform));
     memcpy(sInterpPrevSig, sInterpSig, gsVuUniCount * sizeof(uint32_t));
     memcpy(sInterpPrevKind, sInterpKind, gsVuUniCount * sizeof(uint16_t));
+    memcpy(sInterpPrevBlkView, sInterpBlkView, gsVuUniCount * sizeof(uint32_t));
     memcpy(sInterpPrevRep, sInterpRep, gsVuUniCount * sizeof(sInterpRep[0]));
     sInterpPrevCount = gsVuUniCount;
 }
