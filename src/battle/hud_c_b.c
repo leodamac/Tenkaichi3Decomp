@@ -727,7 +727,7 @@ void HudCombo_DrawText(void) {
 
         if (pos[0] >= 0 && pos[1] >= 0) {
             BtlMenu_SetScript2(BtlCtrl_GetObj(side)->skillScript);
-            BtlText_DrawEntryName(pos[0], pos[1], gHudCombo->text[side], side, alpha);
+            BtlText_DrawEntryName(pos[0], pos[1], gHudCombo->text[side], HUD_SCR(side), alpha); /* (the 4th: left or right aligned) */
         }
     }
 }

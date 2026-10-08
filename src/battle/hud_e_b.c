@@ -1115,7 +1115,7 @@ void HudPrompt_DrawNames(void) {
         }
         if (idx >= 0) {
             BtlMenu_SetScript2(BtlCtrl_GetObj(i)->unkBC);
-            BtlText_DrawEntryName(pos->x, pos->y, idx, i, alpha);
+            BtlText_DrawEntryName(pos->x, pos->y, idx, HUD_SCR(i), alpha); /* (the 4th: left or right aligned) */
         }
     }
 }
