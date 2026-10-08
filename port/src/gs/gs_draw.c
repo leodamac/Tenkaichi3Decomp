@@ -1315,6 +1315,12 @@ static void interp_signatures(uint32_t *sig) {
                 }
             }
             sig[d->uniform] = (sig[d->uniform] * 31u + h) | 1u;
+            if (d->vu == 3) {
+                /* The ground under a fighter that carries its shadow (vertex program 6): its vertices are the piece
+                   of ground the fighter stands over, new numbers every picture, so the vertices are no identity.
+                   All of them count as the same kind; which fighter's it is, the nearest matrices decide. */
+                sig[d->uniform] = 0x53484457u;
+            }
         }
     }
 }
@@ -1424,7 +1430,9 @@ static int interp_build(void) {
             continue;
         }
         for (j = sInterpBucket[sInterpSig[i] * 2654435761u >> 20]; j != 0xFFFF; j = sInterpNext[j]) {
-            if (sInterpPrevSig[j] == sInterpSig[i] && !sInterpUsed[j]) {
+            /* (a shadow's strips are several blocks with one fighter's matrices, and their number changes with
+               the ground: each takes the nearest of the previous picture, used before or not) */
+            if (sInterpPrevSig[j] == sInterpSig[i] && (!sInterpUsed[j] || sInterpSig[i] == 0x53484457u)) {
                 const float *pf = (const float *)&sInterpPrev[j];
                 float dist = 0.0f;
                 for (k = 0; k < 56; k++) { /* bones, pivots, screen matrix */
