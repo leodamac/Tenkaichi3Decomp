@@ -58,10 +58,11 @@ function cleanAddrs(addrs) {
     return out.length > 0 ? out : null;
 }
 
-// Short-lived access to Cloudflare's TURN service for one host, or null (no key set up, or the service said no).
+// Short-lived access to Cloudflare's TURN service for one host: {server, username, credential}, or {why} saying what
+// stood in the way (never anything secret: for whoever sets the Worker up).
 async function turnAccess(env) {
     if (!env.TURN_KEY_ID || !env.TURN_KEY_TOKEN) {
-        return null;
+        return { why: `no key: the secret ${!env.TURN_KEY_ID ? "TURN_KEY_ID" : "TURN_KEY_TOKEN"} is not set` };
     }
     try {
         const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`, {
@@ -70,20 +71,22 @@ async function turnAccess(env) {
             body: JSON.stringify({ ttl: 10800 }),
         });
         if (!r.ok) {
-            return null;
+            return { why: `the TURN service answered ${r.status} (401 or 403: the key ID or the token is not right)` };
         }
         const j = await r.json();
-        for (const s of j.iceServers ?? []) {
+        // iceServers is a list of entries, or (older answers) one entry
+        const list = Array.isArray(j.iceServers) ? j.iceServers : j.iceServers ? [j.iceServers] : [];
+        for (const s of list) {
             const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
             const udp = urls.find((u) => typeof u === "string" && u.startsWith("turn:") && u.includes("transport=udp"));
             if (udp && s.username && s.credential) {
                 return { server: udp.slice(5).split("?")[0], username: s.username, credential: s.credential };
             }
         }
+        return { why: "the TURN service's answer had no UDP relay in it" };
     } catch (e) {
-        // no relay then
+        return { why: "the TURN service could not be asked" };
     }
-    return null;
 }
 
 export default {
@@ -122,7 +125,7 @@ export default {
                     await env.DB.prepare("INSERT INTO rooms (code, made, version, ip, host_key, host_name, host_addrs) VALUES (?, ?, ?, ?, ?, ?, ?)")
                         .bind(code, now, body.v, ip, key, cleanName(body.name), JSON.stringify(addrs)).run();
                     const turn = await turnAccess(env);
-                    return reply(turn ? { code, key, you: ip, turn } : { code, key, you: ip });
+                    return reply(turn.server ? { code, key, you: ip, turn } : { code, key, you: ip, noRelay: turn.why });
                 } catch (e) {
                     // the code is taken: another one
                 }
