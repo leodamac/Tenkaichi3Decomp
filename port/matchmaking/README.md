@@ -3,7 +3,20 @@
 A small Cloudflare Worker that lets two players of the port find each other with a short code, without typing
 addresses or forwarding a port. It only introduces the two games to each other: no game data passes through it.
 
-Files: `worker.js` (the Worker), `schema.sql` (its one table).
+Files: `worker.js` (the Worker), `schema.sql` (its one table, as ONE line without comments: the dashboard's console
+joins what is pasted into one line, and a `--` comment then takes the rest of the statement with it).
+
+The table `rooms`, one row per room (rows older than ten minutes are removed whenever a room is made):
+
+| Column | |
+|---|---|
+| `code` | what the host tells the other player: 6 characters |
+| `made` | seconds since 1970 |
+| `version` | the game's netcode version: both players need the same |
+| `ip` | the host's address as Cloudflare saw it (for the limit of rooms per address) |
+| `host_key`, `join_key` | secrets handed to each player, so nobody else can read or end the room |
+| `host_name`, `join_name` | the players' names |
+| `host_addrs`, `join_addrs` | JSON: the addresses each game can be reached at ("ip:port"), best first |
 
 ## What it keeps
 
