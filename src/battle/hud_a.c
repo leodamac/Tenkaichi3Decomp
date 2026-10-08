@@ -128,6 +128,9 @@ extern void HudPrompt_Term(void);
 extern void HudPrompt_Reset(void);
 extern void HudPrompt_SelectSide(s32 side);                    /* select the side */
 extern void HudPrompt_SetButton(s32 side, s32 button, s32 arg);
+#ifdef PORT
+extern int Port_ClashSquare(void), Port_NetActive(void), Port_NetMe(void); /* port/src/gs */
+#endif
 extern void HudPrompt_SetCommand(s32 side, s32 count, s32 *buttons, s32 *kinds, s32 idx);
 extern void HudPrompt_ClearCommand(s32 side);
 extern void HudPrompt_AcceptCommand(s32 side);
@@ -433,6 +436,14 @@ void Hud_PreUpdate(void) {
                 button = tbl[button];
                 button += kindOfs[kind] * 4;
                 HudPrompt_SetButton(side, button, n / 4);
+#ifdef PORT
+            /* PC build, "Clashes: Square counts as a direction": the prompt of a clash is then the game's own
+               "press this button again and again" (as when ki has run out) with Square, not the turning stick.
+               In an online match only on this player's own side. */
+            } else if (Port_ClashSquare() && (!Port_NetActive() || Port_NetMe() == side) &&
+                       (BtlCtrl_TestFlagE6Pad1(side) || BtlCtrl_TestFlagE6Pad(side, &pad))) {
+                HudPrompt_SetButton(side, 1, 0); /* icon 1 = Square, style 0 = pressed and released */
+#endif
             } else if (BtlCtrl_TestFlagE6Pad1(side)) {
                 HudPrompt_SetButton(side, 12, 1);
             } else if (BtlCtrl_TestFlagE6Pad(side, &pad)) {
