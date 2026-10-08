@@ -1290,15 +1290,30 @@ static uint32_t sInterpPrevCount;
 static int sInterpPending;
 static struct { uint32_t verts, vuVerts, vuIdx, vuUni, draws; int anchor; unsigned skipped, native; unsigned tdraws[MAX_TARGETS]; } sInterpSaved;
 unsigned gInterpShown, gInterpSkipped; /* in-between pictures shown / left out since the start */
+static unsigned gInterpPaired, gInterpUnpaired, gInterpCamera; /* blocks blended / without a partner / of those, moved by the camera's change (BT3_INTERP_LOG) */
 
+/* What a uniform block draws, as a number that is the same in the next picture: the kind of each of its draws and
+   the first vertices of each (they are in model space: the same mesh has the same numbers every frame, wherever it
+   stands in the list; the stage's pieces come and go with what the camera sees, so the place in the list is no
+   identity). */
 static void interp_signatures(uint32_t *sig) {
-    uint32_t n;
+    uint32_t n, k, j;
 
     memset(sig, 0, gsVuUniCount * sizeof(uint32_t));
     for (n = 0; n < gsDrawCount; n++) {
         const GsDraw *d = &gsDraws[n];
         if (d->vu != 0 && d->uniform >= 0 && (uint32_t)d->uniform < gsVuUniCount) {
-            sig[d->uniform] = sig[d->uniform] * 31u + (d->count * 2654435761u ^ (uint32_t)d->tex ^ (uint32_t)d->pipeline << 20 ^ (uint32_t)d->vu << 28) + 1u;
+            uint32_t h = d->count * 2654435761u ^ (uint32_t)d->vu << 28; /* (not its texture or pipeline: a layer's texture can change every frame) */
+            for (k = 0; k < 4 && k < d->count; k++) {
+                uint32_t v = gsVuIdx[d->first + k];
+                if (v < gsVuVertCount) {
+                    const uint32_t *w = (const uint32_t *)&gsVuVerts[v * 12];
+                    for (j = 0; j < 12; j++) {
+                        h = (h ^ w[j]) * 16777619u;
+                    }
+                }
+            }
+            sig[d->uniform] = (sig[d->uniform] * 31u + h) | 1u;
         }
     }
 }
@@ -1322,7 +1337,64 @@ static int interp_screen_pos(const Vu0Uniform *u, float *x, float *y) {
     return s[3] > 0.0f ? 1 : -1;
 }
 
-/* Fills sInterpBlend for the frame just recorded; 0 = no in-between picture for this one. */
+/* 4x4 matrices as the uniform block has them (columns). */
+static void interp_mul(const float *a, const float *b, float *o) {
+    int c, r;
+
+    for (c = 0; c < 4; c++) {
+        for (r = 0; r < 4; r++) {
+            o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+        }
+    }
+}
+
+static int interp_inverse(const float *m, float *o) {
+    double a[4][8];
+    int i, j, k;
+
+    for (i = 0; i < 4; i++) {
+        for (j = 0; j < 4; j++) {
+            a[i][j] = m[j * 4 + i];
+            a[i][4 + j] = i == j;
+        }
+    }
+    for (i = 0; i < 4; i++) {
+        int piv = i;
+        double d;
+        for (k = i + 1; k < 4; k++) {
+            if (fabs(a[k][i]) > fabs(a[piv][i])) { piv = k; }
+        }
+        if (fabs(a[piv][i]) < 1e-12) {
+            return 0;
+        }
+        if (piv != i) {
+            for (j = 0; j < 8; j++) { double x = a[i][j]; a[i][j] = a[piv][j]; a[piv][j] = x; }
+        }
+        d = a[i][i];
+        for (j = 0; j < 8; j++) { a[i][j] /= d; }
+        for (k = 0; k < 4; k++) {
+            if (k != i) {
+                d = a[k][i];
+                for (j = 0; j < 8; j++) { a[k][j] -= d * a[i][j]; }
+            }
+        }
+    }
+    for (i = 0; i < 4; i++) {
+        for (j = 0; j < 4; j++) {
+            o[j * 4 + i] = (float)a[i][4 + j];
+        }
+    }
+    return 1;
+}
+
+/* Fills sInterpBlend for the frame just recorded; 0 = no in-between picture for this one.
+   Each block of this picture is paired with the block of the previous picture that draws the same mesh; of several
+   that do (a piece of scenery used more than once) the one whose matrices are nearest. */
+static uint16_t sInterpBucket[4096];
+static uint16_t sInterpNext[MAX_VU_UNIFORMS];
+static uint8_t sInterpUsed[MAX_VU_UNIFORMS];
+static int16_t sInterpPair[MAX_VU_UNIFORMS]; /* the previous picture's block each of this picture's was paired with, -1 none */
+
 static int interp_build(void) {
     uint32_t i, paired = 0, jumped = 0;
     const float t = 0.5f;
@@ -1330,25 +1402,54 @@ static int interp_build(void) {
     if (gsVuUniCount == 0 || sInterpPrevCount == 0) {
         return 0;
     }
+    memset(sInterpBucket, 0xFF, sizeof(sInterpBucket));
+    memset(sInterpUsed, 0, sInterpPrevCount);
+    for (i = sInterpPrevCount; i-- > 0;) { /* (backwards: each chain lists its blocks in the order of the list) */
+        uint32_t b = sInterpPrevSig[i] * 2654435761u >> 20;
+        sInterpNext[i] = sInterpBucket[b];
+        sInterpBucket[b] = (uint16_t)i;
+    }
     for (i = 0; i < gsVuUniCount; i++) {
         const Vu0Uniform *c = &gsVuUni[i];
         Vu0Uniform *o = &sInterpBlend[i];
-        float xa, ya, xb, yb;
-        int sa, sb, k;
+        const float *cf = (const float *)c;
+        float xa, ya, xb, yb, bestDist = 0.0f;
+        int sa, sb, k, best = -1;
+        uint16_t j;
 
         *o = *c;
-        if (i >= sInterpPrevCount || sInterpSig[i] != sInterpPrevSig[i] || sInterpSig[i] == 0) {
+        sInterpPair[i] = -1;
+        if (sInterpSig[i] == 0) {
             continue;
         }
-        sa = interp_screen_pos(&sInterpPrev[i], &xa, &ya);
+        for (j = sInterpBucket[sInterpSig[i] * 2654435761u >> 20]; j != 0xFFFF; j = sInterpNext[j]) {
+            if (sInterpPrevSig[j] == sInterpSig[i] && !sInterpUsed[j]) {
+                const float *pf = (const float *)&sInterpPrev[j];
+                float dist = 0.0f;
+                for (k = 0; k < 56; k++) { /* bones, pivots, screen matrix */
+                    dist += fabsf(pf[k] - cf[k]);
+                }
+                if (best < 0 || dist < bestDist) {
+                    best = j;
+                    bestDist = dist;
+                }
+            }
+        }
+        sInterpPair[i] = -1;
+        if (best < 0) {
+            continue;
+        }
+        sa = interp_screen_pos(&sInterpPrev[best], &xa, &ya);
         sb = interp_screen_pos(c, &xb, &yb);
         if (sa != sb || (sa != 0 && (fabsf(xa - xb) > 160.0f || fabsf(ya - yb) > 120.0f))) {
             jumped++;
             continue;
         }
+        sInterpUsed[best] = 1;
+        sInterpPair[i] = best;
         paired++;
         {
-            const float *pf = (const float *)&sInterpPrev[i], *cf = (const float *)c;
+            const float *pf = (const float *)&sInterpPrev[best];
             float *of = (float *)o;
             /* boneA, boneB, pivotA, pivotB, screen, light: the first 60 floats; colours and misc stay picture n's */
             for (k = 0; k < 60; k++) {
@@ -1356,6 +1457,61 @@ static int interp_build(void) {
             }
         }
     }
+    /* A block without a partner (a piece of scenery that came into view, a mesh whose strips changed) would stand
+       half a tick ahead of its blended neighbours: a seam. What moved for it is at least the camera: for an object
+       standing still, screen matrix = camera * model, so (previous screen) = D * (this screen) with one D for all
+       of them, D = previous * inverse(this) of any still object. D is taken from the first paired block whose
+       bones did not change and accepted if a second one agrees. */
+    {
+        float D[16], inv[16], chk[16];
+        int have = 0, agreed = 0;
+
+        for (i = 0; i < gsVuUniCount && !agreed; i++) {
+            const Vu0Uniform *c = &gsVuUni[i], *q;
+            if (sInterpPair[i] < 0) {
+                continue;
+            }
+            q = &sInterpPrev[sInterpPair[i]];
+            if (memcmp(c->boneA, q->boneA, 40 * sizeof(float)) != 0) { /* bones and pivots */
+                continue;
+            }
+            if (!have) {
+                if (interp_inverse(c->screen, inv)) {
+                    interp_mul(q->screen, inv, D);
+                    have = 1;
+                }
+            } else {
+                float err = 0.0f, mag = 0.0f;
+                int k;
+                interp_mul(D, c->screen, chk);
+                for (k = 0; k < 16; k++) {
+                    err += fabsf(chk[k] - q->screen[k]);
+                    mag += fabsf(q->screen[k]);
+                }
+                if (err <= mag * 0.002f) {
+                    agreed = 1;
+                } else {
+                    break; /* the two do not share a camera move: no guess */
+                }
+            }
+        }
+        if (agreed) {
+            for (i = 0; i < gsVuUniCount; i++) {
+                if (sInterpPair[i] < 0 && sInterpSig[i] != 0) {
+                    const Vu0Uniform *c = &gsVuUni[i];
+                    Vu0Uniform *o = &sInterpBlend[i];
+                    int k;
+                    interp_mul(D, c->screen, chk);
+                    for (k = 0; k < 16; k++) {
+                        o->screen[k] = chk[k] + (c->screen[k] - chk[k]) * t;
+                    }
+                    gInterpCamera++;
+                }
+            }
+        }
+    }
+    gInterpPaired += paired;
+    gInterpUnpaired += gsVuUniCount - paired;
     return paired != 0 && jumped * 2 <= paired;
 }
 
@@ -1440,7 +1596,9 @@ void GsGpu_FrameEnd(void) {
             sInterpPending = 1;
             gInterpShown++;
             if (getenv("BT3_INTERP_LOG") != NULL && (gInterpShown + gInterpSkipped) % 300 == 0) {
-                fprintf(stderr, "interp: %u in-between pictures shown, %u left out\n", gInterpShown, gInterpSkipped);
+                fprintf(stderr, "interp: %u in-between pictures shown, %u left out; blocks: %u blended, %u not\n", gInterpShown, gInterpSkipped, gInterpPaired, gInterpUnpaired);
+                fprintf(stderr, "interp:   of those without a partner, %u moved with the camera\n", gInterpCamera);
+                gInterpPaired = gInterpUnpaired = gInterpCamera = 0;
             }
         } else {
             if (gsInterp > 0) {
