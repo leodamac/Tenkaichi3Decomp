@@ -1308,7 +1308,7 @@ static unsigned gInterpTicks;
 static uint64_t sInterpBlendShown, sInterpBlendTook; /* when the in-between picture was handed to the screen; how long replaying its list took */
 static struct { uint32_t verts, vuVerts, vuIdx, vuUni, draws; int anchor; unsigned skipped, native; unsigned tdraws[MAX_TARGETS]; } sInterpSaved;
 unsigned gInterpShown, gInterpSkipped; /* in-between pictures shown / left out since the start */
-static unsigned gInterpCuts, gInterpStatic;
+static unsigned gInterpCuts, gInterpStatic, gInterpNotMutual;
 static unsigned gInterpFollowed, gInterpThrough; /* ticks left without in-between pictures because the camera's way crossed the scenery */
 static unsigned gInterpPaired, gInterpUnpaired, gInterpCamera; /* blocks blended / without a partner / of those, moved by the camera's change (BT3_INTERP_LOG) */
 
@@ -2521,7 +2521,7 @@ static void interp_build_verts(float t) {
            on pieces of the previous picture, corner for corner. Only asked while the camera moves: when it stands,
            everything would pass. */
         staticKind = 0;
-        if (pEnd > lo && !sInterpPrims[i].flat2d && sInterpHaveD && sInterpCamMove > 3.0f) {
+        if (pEnd > lo && !sInterpPrims[i].flat2d && sInterpHaveD) { /* (also while the camera stands: what lands then did not move) */
             uint32_t stepS = (end - i) / 24 ? (end - i) / 24 : 1, tested = 0, okS = 0, rs, j;
             for (rs = 0; rs < end - i; rs += stepS) {
                 const InterpPrim *c = &sInterpPrims[i + rs];
@@ -2538,7 +2538,7 @@ static void interp_build_verts(float t) {
                 for (j = lo; j < pEnd && !found; j++) {
                     const Vtx *pv = &sInterpPrevVerts[sInterpPrevPrims[j].first];
                     for (k = 0; k < nv; k++) {
-                        if (fabsf(pv[k].x - px[k]) > 1.5f || fabsf(pv[k].y - py[k]) > 1.5f) {
+                        if (fabsf(pv[k].x - px[k]) > 1.0f || fabsf(pv[k].y - py[k]) > 1.0f) {
                             break;
                         }
                     }
@@ -2668,6 +2668,29 @@ static void interp_build_verts(float t) {
                     best = (int)j;
                     bestD = d;
 
+                }
+            }
+            if (best >= 0 && bestD > 4.0f * (float)nv) {
+                /* The partner must want this piece too: if another piece of this picture lies clearly nearer to it,
+                   it is that one's, and this piece has none (a tile of the sea that came into view, or one cut off
+                   at the screen's edge into another number of triangles: paired with a tile some way off, it stood
+                   half way to it for one picture, a blue square on the beach). */
+                const Vtx *pv = &sInterpPrevVerts[sInterpPrevPrims[lo + best].first];
+                uint32_t n = end - i, r0 = r > INTERP_WINDOW ? r - INTERP_WINDOW : 0, r1 = r + INTERP_WINDOW + 1 < n ? r + INTERP_WINDOW + 1 : n, r2;
+                for (r2 = r0; r2 < r1; r2++) {
+                    const Vtx *ov2 = &gsVerts[sInterpPrims[i + r2].first];
+                    float d2 = 0.0f;
+                    if (r2 == r) {
+                        continue;
+                    }
+                    for (k = 0; k < nv && d2 < bestD * 0.6f; k++) {
+                        d2 += fabsf(pv[k].x - ov2[k].x) + fabsf(pv[k].y - ov2[k].y);
+                    }
+                    if (d2 < bestD * 0.6f) {
+                        best = -1;
+                        gInterpNotMutual++;
+                        break;
+                    }
                 }
             }
             if (best >= 0) {
