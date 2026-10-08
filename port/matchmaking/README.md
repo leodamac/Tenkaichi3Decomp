@@ -35,6 +35,18 @@ and nothing after the room has expired.
    `bt3-rooms`. Deploy.
 4. Open the Worker's address in a browser: it answers with one line of text.
 
+## The relay (optional)
+
+Some pairs of players cannot reach each other directly (strict routers, mobile connections). With a TURN key the
+host of a room also gets an address at Cloudflare's TURN service that passes the match's packets on.
+
+1. Realtime -> TURN Server -> Create. Note the Turn Token ID and the API token (shown once).
+2. The Worker -> Settings -> Variables and Secrets: add two **secrets**, `TURN_KEY_ID` and `TURN_KEY_TOKEN`. Deploy.
+
+Without the two secrets the Worker works as before, without a relay. The key never leaves the Worker: each host is
+handed a name and password that are good for three hours. Cloudflare's TURN is free for the first 1,000 GB a month
+(a match is about 50 MB an hour, and only matches that cannot connect directly use it).
+
 ## Trying it by hand
 
     W=https://<worker>.<subdomain>.workers.dev

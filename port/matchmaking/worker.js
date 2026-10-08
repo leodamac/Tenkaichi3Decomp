@@ -8,10 +8,15 @@
 // code, the two player names, the addresses each game reported, and the host's address as Cloudflare saw it.
 //
 // Requests are JSON over POST:
-//   /v1/host   {v, name, addrs}        -> {code, key, you}
+//   /v1/host   {v, name, addrs}        -> {code, key, you, turn?}
+//   /v1/addrs  {code, key, addrs}      -> {}       (the host, once it has more addresses: its relay address)
 //   /v1/join   {v, code, name, addrs}  -> {key, you, peer: {name, addrs}}
 //   /v1/poll   {code, key}             -> {peer: {name, addrs} | null}     (the host asks until someone has joined)
 //   /v1/leave  {code, key}             -> {}
+// `turn` (only if the Worker has a TURN key: the secrets TURN_KEY_ID and TURN_KEY_TOKEN) is what the host needs to
+// get a relay address from Cloudflare's TURN service: {server, username, credential}, good for three hours. The
+// host publishes that address as "relay=ip:port" among its addresses; the other player's addresses carry
+// "seen=ip", the address this Worker saw them under (the relay must be told whom to let through).
 // `v` is the game's netcode version, `addrs` a list of "ip:port" strings (what the game found out about itself),
 // `you` the caller's address as seen here (the game uses it when it could not find out its own). Errors come back
 // as {error: "..."} with a 4xx status: "version" (the two games differ), "no room", "full", "busy", "bad request".
@@ -45,12 +50,40 @@ function cleanAddrs(addrs) {
         return null;
     }
     const out = [];
-    for (const a of addrs.slice(0, 4)) {
-        if (typeof a === "string" && /^[0-9a-fA-F:.\[\]]{3,64}:\d{1,5}$/.test(a)) {
+    for (const a of addrs.slice(0, 5)) {
+        if (typeof a === "string" && /^(relay=)?[0-9a-fA-F:.\[\]]{3,64}:\d{1,5}$/.test(a)) {
             out.push(a);
         }
     }
     return out.length > 0 ? out : null;
+}
+
+// Short-lived access to Cloudflare's TURN service for one host, or null (no key set up, or the service said no).
+async function turnAccess(env) {
+    if (!env.TURN_KEY_ID || !env.TURN_KEY_TOKEN) {
+        return null;
+    }
+    try {
+        const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${env.TURN_KEY_TOKEN}`, "content-type": "application/json" },
+            body: JSON.stringify({ ttl: 10800 }),
+        });
+        if (!r.ok) {
+            return null;
+        }
+        const j = await r.json();
+        for (const s of j.iceServers ?? []) {
+            const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+            const udp = urls.find((u) => typeof u === "string" && u.startsWith("turn:") && u.includes("transport=udp"));
+            if (udp && s.username && s.credential) {
+                return { server: udp.slice(5).split("?")[0], username: s.username, credential: s.credential };
+            }
+        }
+    } catch (e) {
+        // no relay then
+    }
+    return null;
 }
 
 export default {
@@ -88,7 +121,8 @@ export default {
                 try {
                     await env.DB.prepare("INSERT INTO rooms (code, made, version, ip, host_key, host_name, host_addrs) VALUES (?, ?, ?, ?, ?, ?, ?)")
                         .bind(code, now, body.v, ip, key, cleanName(body.name), JSON.stringify(addrs)).run();
-                    return reply({ code, key, you: ip });
+                    const turn = await turnAccess(env);
+                    return reply(turn ? { code, key, you: ip, turn } : { code, key, you: ip });
                 } catch (e) {
                     // the code is taken: another one
                 }
@@ -115,6 +149,9 @@ export default {
             }
             const key = randomText(24, ALPHABET);
             // only if nobody has joined yet (the update tells whether it was this request that got the place)
+            if (/^[0-9.]{7,15}$/.test(ip)) {
+                addrs.push("seen=" + ip); // for the host's relay: whom to let through
+            }
             const done = await env.DB.prepare("UPDATE rooms SET join_key = ?, join_name = ?, join_addrs = ? WHERE code = ? AND join_key IS NULL")
                 .bind(key, cleanName(body.name), JSON.stringify(addrs), code).run();
             if (!done.meta || done.meta.changes !== 1) {
@@ -132,6 +169,14 @@ export default {
                 return reply({ peer: room.join_key !== null ? { name: room.join_name, addrs: JSON.parse(room.join_addrs) } : null });
             }
             return reply({ peer: { name: room.host_name, addrs: JSON.parse(room.host_addrs) } });
+        }
+        if (what === "addrs") { // the host has found out more about how it can be reached
+            const addrs = cleanAddrs(body.addrs);
+            if (!isHost || addrs === null) {
+                return reply({ error: "bad request" }, 400);
+            }
+            await env.DB.prepare("UPDATE rooms SET host_addrs = ? WHERE code = ?").bind(JSON.stringify(addrs), code).run();
+            return reply({});
         }
         if (what === "leave") {
             await env.DB.prepare("DELETE FROM rooms WHERE code = ?").bind(code).run();
