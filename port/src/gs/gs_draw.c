@@ -1288,6 +1288,7 @@ static Vu0Uniform *sInterpPrev, *sInterpBlend;
 static uint32_t *sInterpPrevSig, *sInterpSig;
 static uint32_t sInterpPrevCount;
 static int sInterpPending;
+static uint64_t sInterpBlendShown, sInterpBlendTook; /* when the in-between picture was handed to the screen; how long replaying its list took */
 static struct { uint32_t verts, vuVerts, vuIdx, vuUni, draws; int anchor; unsigned skipped, native; unsigned tdraws[MAX_TARGETS]; } sInterpSaved;
 unsigned gInterpShown, gInterpSkipped; /* in-between pictures shown / left out since the start */
 static unsigned gInterpPaired, gInterpUnpaired, gInterpCamera; /* blocks blended / without a partner / of those, moved by the camera's change (BT3_INTERP_LOG) */
@@ -1530,6 +1531,7 @@ typedef struct InterpPrim {
 #define INTERP_MAX_PRIMS (MAX_VERTS / 3)
 #define INTERP_WINDOW 48      /* triangles before and after the same place in the run */
 #define INTERP_FAR 90.0f      /* GS pixels a vertex may move in a tick and still be blended */
+#define INTERP_FAR_2D 5.0f    /* the same for 2D art (HUD, text) */
 static Vtx *sInterpPrevVerts, *sInterpBlendVerts;
 static InterpPrim *sInterpPrevPrims, *sInterpPrims;
 static uint32_t sInterpPrevPrimCount, sInterpPrimCount, sInterpPrevVertCount;
@@ -1632,7 +1634,10 @@ static void interp_build_verts(float t) {
                     if (dx > far) { far = dx; }
                     if (dy > far) { far = dy; }
                 }
-                if (far > INTERP_FAR) {
+                /* 2D art moves only a little or not at all: the digits of a number that changes are the same few
+                   glyphs in new places, and the nearest "same glyph" is a different digit of the old number (the
+                   damage counter lost digits in the in-between pictures) */
+                if (far > (c->flat2d ? INTERP_FAR_2D : INTERP_FAR)) {
                     sawFar = 1;
                     continue;
                 }
@@ -1688,6 +1693,22 @@ static void interp_remember(void) {
     sInterpPrevCount = gsVuUniCount;
 }
 
+/* BT3_PRESENT_LOG=<file>: one line per picture shown: time in microseconds, kind (B in-between, R the real one
+   after it, S a picture shown alone), the vertical blank count. For measuring how evenly the pictures come. */
+static void interp_present_log(char kind) {
+    static FILE *fp;
+    static int tried;
+    extern unsigned gPortVBlanks;
+
+    if (!tried) {
+        tried = 1;
+        fp = getenv("BT3_PRESENT_LOG") != NULL ? fopen(getenv("BT3_PRESENT_LOG"), "w") : NULL;
+    }
+    if (fp != NULL) {
+        fprintf(fp, "%llu %c %u\n", (unsigned long long)(gpu_now() / 1000ull), kind, gPortVBlanks);
+    }
+}
+
 /* The real picture n, one vertical blank after its in-between picture (Port_VBlank). */
 void GsGpu_InterpFlush(void) {
     int i;
@@ -1719,7 +1740,18 @@ void GsGpu_InterpFlush(void) {
     for (i = 0; i < gsTargetCount && i < MAX_TARGETS; i++) {
         gsTargets[i].draws = sInterpSaved.tdraws[i];
     }
+    /* Half a tick after the in-between picture, not "at the vertical blank": the in-between picture is shown when
+       the game has finished computing the tick, a millisecond or two after a blank, so the real one at the next
+       blank came 15 ms after it and the next in-between picture 18 ms after that (measured). Waiting out the
+       difference makes them even; it is the time the game took for the tick. */
+    if (getenv("BT3_UNCAPPED") == NULL) {
+        uint64_t due = sInterpBlendShown + 16683350ull - sInterpBlendTook, now = gpu_now(); /* (replaying the list takes the same time again) */
+        if (now < due && due - now < 8000000ull) {
+            SDL_DelayPrecise(due - now);
+        }
+    }
     sBackend->frameEnd();
+    interp_present_log('R');
     scale_apply();
 }
 
@@ -1772,7 +1804,14 @@ void GsGpu_FrameEnd(void) {
             if (getenv("BT3_INTERP_3D") == NULL) {
                 gsVerts = sInterpBlendVerts; /* (after interp_remember: that keeps the real vertices) */
             }
+            sInterpBlendTook = gpu_now();
             sBackend->frameEnd(); /* the in-between picture; the real one follows at the next vertical blank */
+            sInterpBlendShown = gpu_now();
+            sInterpBlendTook = sInterpBlendShown - sInterpBlendTook;
+            if (sInterpBlendTook > 8000000ull) {
+                sInterpBlendTook = 8000000ull;
+            }
+            interp_present_log('B');
             gsVuUni = real;
             gsVerts = realVerts;
             sInterpPending = 1;
@@ -1791,6 +1830,7 @@ void GsGpu_FrameEnd(void) {
                 gInterpSkipped++;
             }
             sBackend->frameEnd();
+            interp_present_log('S');
             scale_apply();
         }
     }
