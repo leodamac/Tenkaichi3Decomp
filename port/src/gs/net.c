@@ -45,13 +45,15 @@ extern int Port_PadRead(int socket, unsigned char *data); /* gs_input.c: the key
 void Port_NetLeave(void);
 
 enum { PAD = 18, RING = 4096, REDUNDANT = 16, MAGIC = 0x4E335442 /* "BT3N" */ };
-enum { T_HELLO = 1, T_HELLO_ACK = 2, T_INPUT = 3, T_BYE = 4, T_PING = 5, T_PONG = 6, T_CONFIG = 7, T_CONFIG_ACK = 8 };
+enum { T_HELLO = 1, T_HELLO_ACK = 2, T_INPUT = 3, T_BYE = 4, T_PING = 5, T_PONG = 6, T_CONFIG = 7, T_CONFIG_ACK = 8,
+       T_PUNCH = 9 /* nothing to read: sent so that the sender's router lets the other side's packets in (room codes) */ };
 /* The version of what goes over the line. The greeting and its answer carry it, and two copies that differ do not
    start a match (the input packets changed with version 2: times for the ping were added; a copy that read them
    the old way took them for input). 1 was releases 0.1.8 and 0.1.9, which said no version. */
 enum { NET_VERSION = 3, IN_HEAD = 32 }; /* 3 (0.1.15): the host's battle rules travel with its choices */
 static int sVersionBad; /* the other side answered with another version */
 static const uint32_t kVersion = NET_VERSION;
+#include "net_match.h"
 static int sLobbyOther;
 
 /* What the meter shows (ui.cpp): the round trip time, and per second how often the game went back, how far, and
@@ -91,6 +93,11 @@ static char sNames[2][NAME_LEN], sMyName[NAME_LEN] = "Player";
 void Port_NetNameSet(const char *name) {
     snprintf(sMyName, sizeof(sMyName), "%s", name != NULL && name[0] != '\0' ? name : "Player");
 }
+
+/* A match found with a room code (the lobby, below): the local port the lobby's socket had, which the session's
+   socket takes again, and for the host the address the other player's greeting came from. */
+static int sCodeLocalPort, sCodePunchSet;
+static struct sockaddr_in sCodePunch;
 
 /* The match's rules, chosen by the host in the lobby window (the game's own versus menu is not shown in a session):
    the battle type as the versus menu leaves it (0 single, 1 team, 2 DP battle), the row of the DP limit list
@@ -354,6 +361,21 @@ static void net_start(int role, const char *host, const char *join) {
     fcntl(sSock, F_SETFL, fcntl(sSock, F_GETFL, 0) | O_NONBLOCK);
 #endif
     sMe = sMode - 1;
+    if (getenv("BT3_NET_LOCALPORT") != NULL && sCodeLocalPort == 0) { /* (across the restart into the session) */
+        sCodeLocalPort = atoi(getenv("BT3_NET_LOCALPORT"));
+    }
+    if (getenv("BT3_NET_PUNCH") != NULL && !sCodePunchSet) {
+        char text[64], *colon;
+        snprintf(text, sizeof(text), "%s", getenv("BT3_NET_PUNCH"));
+        colon = strrchr(text, ':');
+        if (colon != NULL) {
+            *colon = '\0';
+            memset(&sCodePunch, 0, sizeof(sCodePunch));
+            sCodePunch.sin_family = AF_INET;
+            sCodePunch.sin_port = htons((uint16_t)atoi(colon + 1));
+            sCodePunchSet = inet_pton(AF_INET, text, &sCodePunch.sin_addr) == 1;
+        }
+    }
     if (getenv("BT3_NET_NAME") != NULL) { /* (across the restart into the session) */
         Port_NetNameSet(getenv("BT3_NET_NAME"));
     }
@@ -423,11 +445,22 @@ static void net_start(int role, const char *host, const char *join) {
             }
             memcpy(&sPeer.sin_addr, he->h_addr_list[0], sizeof(sPeer.sin_addr));
         }
+        if (sCodeLocalPort != 0) {
+            /* a match found with a room code: from the port the lobby used, so that the routers on the way keep
+               taking this for the same conversation */
+            local.sin_port = htons((uint16_t)sCodeLocalPort);
+            bind(sSock, (struct sockaddr *)&local, sizeof(local));
+        }
         fprintf(stderr, "bt3: net: joining %s (player 2)...\n", join);
     }
     t0 = SDL_GetTicksNS();
     while (!sConnected) {
         uint64_t now = SDL_GetTicksNS();
+        if (sMode == 1 && sCodePunchSet && now - last > 100000000ull) {
+            uint32_t punch[2] = {MAGIC, T_PUNCH}; /* (room codes: keeps this side's router open for the one who joins) */
+            sendto(sSock, (const char *)punch, sizeof(punch), 0, (struct sockaddr *)&sCodePunch, sizeof(sCodePunch));
+            last = now;
+        }
         if (sMode == 2 && now - last > 100000000ull) {
             uint32_t hello[3 + NAME_LEN / 4] = {MAGIC, T_HELLO, NET_VERSION};
             memcpy(&hello[3], sMyName, NAME_LEN);
@@ -842,6 +875,16 @@ static void relaunch(int role, const char *join, int port) {
         }
         SETENV("BT3_NET_SESSION", "1");
         SETENV("BT3_NET_NAME", sMyName);
+        {   /* a match found with a room code: the lobby's local port, and for the host where to go on knocking */
+            char text[64] = "";
+            snprintf(value, sizeof(value), "%d", sCodeLocalPort);
+            SETENV("BT3_NET_LOCALPORT", sCodeLocalPort != 0 ? value : NULL);
+            if (sCodePunchSet) {
+                inet_ntop(AF_INET, &sCodePunch.sin_addr, text, sizeof(text));
+                snprintf(value, sizeof(value), "%s:%d", text, ntohs(sCodePunch.sin_port));
+            }
+            SETENV("BT3_NET_PUNCH", sCodePunchSet ? value : NULL);
+        }
         if (role == 1) {
             snprintf(value, sizeof(value), "%u", (unsigned)sRules);
             SETENV("BT3_NET_RULES", value);
@@ -971,6 +1014,18 @@ static int sLobbyRole, sLobbyPort;
 static char sLobbyAddr[128];
 static uint64_t sLobbyLast;
 
+/* Room codes (net_match.c, port/matchmaking): the lobby's states 3 (asking the matchmaking service; the host's code
+   is known at some point, Port_LobbyCode) and, once the other player's addresses are known, 1 as with an address:
+   greetings go to every one of those addresses, and the host sends its own packets there too, so that both routers
+   let the other side in. -3: the service said no (Port_LobbyError); -4: the two could not reach each other. */
+static int sCodeMode, sCodeAddrs;
+static struct sockaddr_in sCodeAddr[MATCH_ADDRS];
+static char sCodeText[8], sCodeError[96];
+static uint64_t sCodeSince;
+
+const char *Port_LobbyCode(void) { return sCodeText; }
+const char *Port_LobbyError(void) { return sCodeError; }
+
 int Port_LobbyStart(int host, const char *address, int port) {
     struct sockaddr_in local;
 
@@ -989,6 +1044,9 @@ int Port_LobbyStart(int host, const char *address, int port) {
     sSock = socket(AF_INET, SOCK_DGRAM, 0);
     fcntl(sSock, F_SETFL, fcntl(sSock, F_GETFL, 0) | O_NONBLOCK);
 #endif
+    sCodeMode = 0;
+    sCodeLocalPort = 0;
+    sCodePunchSet = 0;
     sLobbyRole = host ? 1 : 2;
     sLobbyPort = port;
     snprintf(sLobbyAddr, sizeof(sLobbyAddr), "%s", address != NULL ? address : "");
@@ -1019,7 +1077,34 @@ int Port_LobbyStart(int host, const char *address, int port) {
     return sLobby;
 }
 
+int Port_LobbyStartCode(int host, const char *code) {
+    struct sockaddr_in local;
+    socklen_t len = sizeof(local);
+
+    Port_LobbyStart(1, "", 0); /* a socket on a port of the system's choosing */
+    if (sLobby < 0) {
+        return sLobby;
+    }
+    if (getsockname(sSock, (struct sockaddr *)&local, &len) != 0) {
+        sLobby = -1;
+        return sLobby;
+    }
+    sLobbyRole = host ? 1 : 2;
+    sCodeMode = 1;
+    sCodeAddrs = 0;
+    sCodeText[0] = sCodeError[0] = '\0';
+    sCodeLocalPort = ntohs(local.sin_port);
+    sLobbyPort = sCodeLocalPort;
+    sLobby = 3;
+    Match_Begin(sLobbyRole, sSock, sCodeLocalPort, code, sMyName, NET_VERSION);
+    return sLobby;
+}
+
 void Port_LobbyCancel(void) {
+    if (sCodeMode) {
+        Match_Cancel();
+        sCodeMode = 0;
+    }
     if (sSock >= 0) {
         closesocket(sSock);
         sSock = -1;
@@ -1035,10 +1120,56 @@ int Port_LobbyPoll(void) {
     uint64_t now = SDL_GetTicksNS();
     int n;
 
+    if (sLobby == 3) { /* a room code: what the matchmaking service has said so far */
+        MatchStatus st;
+        int i;
+        Match_Poll(&st);
+        snprintf(sCodeText, sizeof(sCodeText), "%s", st.code);
+        if (st.state == -1) {
+            snprintf(sCodeError, sizeof(sCodeError), "%s", st.error);
+            sLobby = -3;
+        } else if (st.state == 3) {
+            sCodeAddrs = 0;
+            for (i = 0; i < st.peerCount && sCodeAddrs < MATCH_ADDRS; i++) {
+                char text[64], *colon;
+                snprintf(text, sizeof(text), "%s", st.peerAddr[i]);
+                colon = strrchr(text, ':');
+                if (colon != NULL) {
+                    struct sockaddr_in *a = &sCodeAddr[sCodeAddrs];
+                    *colon = '\0';
+                    memset(a, 0, sizeof(*a));
+                    a->sin_family = AF_INET;
+                    a->sin_port = htons((uint16_t)atoi(colon + 1));
+                    if (inet_pton(AF_INET, text, &a->sin_addr) == 1 && a->sin_port != 0) {
+                        sCodeAddrs++;
+                    }
+                }
+            }
+            sCodeSince = now;
+            sLobby = sCodeAddrs > 0 ? 1 : -4;
+        }
+        return sLobby;
+    }
     if (sLobby != 1) {
         return sLobby;
     }
-    if (sLobbyRole == 2 && now - sLobbyLast > 200000000ull) {
+    if (sCodeMode && now - sLobbyLast > 200000000ull) {
+        /* to every address the other player may be reached at: the one who joins greets, the host only knocks */
+        uint32_t hello[3] = {MAGIC, T_HELLO, NET_VERSION}, punch[2] = {MAGIC, T_PUNCH};
+        int i;
+        for (i = 0; i < sCodeAddrs; i++) {
+            if (sLobbyRole == 2) {
+                sendto(sSock, (const char *)hello, sizeof(hello), 0, (struct sockaddr *)&sCodeAddr[i], sizeof(sCodeAddr[i]));
+            } else {
+                sendto(sSock, (const char *)punch, sizeof(punch), 0, (struct sockaddr *)&sCodeAddr[i], sizeof(sCodeAddr[i]));
+            }
+        }
+        sLobbyLast = now;
+        if (now - sCodeSince > 20000000000ull) {
+            sLobby = -4; /* twenty seconds of knocking: the routers do not let the two through to each other */
+            return sLobby;
+        }
+    } else if (!sCodeMode && sLobbyRole == 2 && now - sLobbyLast > 200000000ull) {
         uint32_t hello[3] = {MAGIC, T_HELLO, NET_VERSION};
         sendto(sSock, (const char *)hello, sizeof(hello), 0, (struct sockaddr *)&sPeer, sizeof(sPeer));
         sLobbyLast = now;
@@ -1058,9 +1189,17 @@ int Port_LobbyPoll(void) {
             for (k = 0; k < 3; k++) {
                 sendto(sSock, (const char *)ack, sizeof(ack), 0, (struct sockaddr *)&from, sizeof(from));
             }
+            if (sCodeMode) { /* where the session goes on knocking, so that the greeting of the session gets in */
+                sCodePunch = from;
+                sCodePunchSet = 1;
+            }
             sLobby = 2;
         } else if (sLobbyRole == 2 && type == T_HELLO_ACK) {
             sLobby = n >= 12 && memcmp(pkt + 8, &kVersion, 4) == 0 ? 2 : -2; /* -2: the host is another release */
+            if (sCodeMode && sLobby == 2) { /* the address that answered is the one the session joins */
+                inet_ntop(AF_INET, &from.sin_addr, sLobbyAddr, sizeof(sLobbyAddr));
+                sLobbyPort = ntohs(from.sin_port);
+            }
         }
     }
     return sLobby;
@@ -1071,6 +1210,13 @@ void Port_LobbyLaunch(void) {
     closesocket(sSock);
     sSock = -1;
     sLobby = 0;
+    if (sCodeMode) {
+        Match_Cancel();
+        sCodeMode = 0;
+        if (sLobbyRole == 1) {
+            sLobbyPort = sCodeLocalPort; /* the host's session listens where the lobby did */
+        }
+    }
     if (Port_SessionCan()) {
         Port_SessionRequest(sLobbyRole, sLobbyAddr, sLobbyPort); /* the game's thread makes the change at its next blank */
         return;

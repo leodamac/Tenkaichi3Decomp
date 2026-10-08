@@ -45,6 +45,9 @@ void Port_ClashSquareSet(int on);
 extern int gsInterp;                           // gs_draw.c: in-between pictures on (1) / off (0); -1 before the first frame
 void Port_SettingsWrite(void);
 int Port_LobbyStart(int host, const char *address, int port); // gs/net.c
+int Port_LobbyStartCode(int host, const char *code);         // the same with a room code (the matchmaking service)
+const char *Port_LobbyCode(void);                            // the host's room code, "" until it is known
+const char *Port_LobbyError(void);                           // why the matchmaking failed (state -3)
 int Port_LobbyPoll(void);
 void Port_LobbyCancel(void);
 void Port_LobbyLaunch(void);
@@ -297,6 +300,9 @@ static void net_open(void) {
 static void build_net(void) {
     static char name[17] = "Player", address[64] = "", port[8] = "7000";
     static int tab, roll = -1, delay = 1, battle = -1, timeLimit = 3;
+    static bool useCode = true;       // host with a room code (no port forwarding) or on a port
+    static char roomCode[8] = "";     // the code to join with
+    static int lastState = 0;         // what the lobby said last (for its messages after a failure)
     ImGuiIO &io = ImGui::GetIO();
     bool open = true;
 
@@ -312,8 +318,14 @@ static void build_net(void) {
             if (ImGui::BeginTabItem("Host")) {
                 static const char *const kRoll[] = {"Off (wait for each other)", "Up to 2 frames", "Up to 4 frames", "Up to 6 frames", "Up to 8 frames"};
                 tab = 0;
+                ImGui::Checkbox("Use a room code (no port forwarding needed)", &useCode);
+                ImGui::SetItemTooltip("You get a short code to tell the other player, and the two games find each other through a\n"
+                                      "small matchmaking service. Works with most home routers. Without it you host on a port,\n"
+                                      "which must be reachable from the other player (port forwarding or a virtual network).");
+                ImGui::BeginDisabled(useCode);
                 ImGui::SetNextItemWidth(120.0f);
                 ImGui::InputText("Port", port, sizeof(port), ImGuiInputTextFlags_CharsDecimal);
+                ImGui::EndDisabled();
                 if (roll < 0) { // the choices of last time (new names: the first ones' defaults were 4 frames and delay 1)
                     roll = Port_RollCan() ? Port_Setting("net_rollback2", 8) / 2 : 0;
                     delay = Port_Setting("net_delay2", -1) + 1; // 0 = automatic, else the delay + 1
@@ -361,10 +373,15 @@ static void build_net(void) {
             }
             if (ImGui::BeginTabItem("Join")) {
                 tab = 1;
+                ImGui::SetNextItemWidth(120.0f);
+                ImGui::InputText("Room code", roomCode, sizeof(roomCode), ImGuiInputTextFlags_CharsUppercase | ImGuiInputTextFlags_CharsNoBlank);
+                ImGui::TextDisabled("or, without a code, the host's address and port:");
+                ImGui::BeginDisabled(roomCode[0] != '\0');
                 ImGui::SetNextItemWidth(260.0f);
                 ImGui::InputText("Host's address", address, sizeof(address));
                 ImGui::SetNextItemWidth(120.0f);
                 ImGui::InputText("Port", port, sizeof(port), ImGuiInputTextFlags_CharsDecimal);
+                ImGui::EndDisabled();
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -377,7 +394,26 @@ static void build_net(void) {
                 set_open(false);
                 sNet = false;
             }
-            if (state == 1) {
+            bool byCode = tab == 0 ? useCode : roomCode[0] != '\0';
+            if (state != 0) {
+                lastState = state;
+            }
+            if (state == 3 || (state == 1 && byCode)) { // a room code: asking the service, then reaching the other player
+                if (tab == 0 && Port_LobbyCode()[0] != '\0') {
+                    ImGui::TextUnformatted("Room code:");
+                    ImGui::SameLine();
+                    ImGui::SetWindowFontScale(1.8f);
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "%s", Port_LobbyCode());
+                    ImGui::SetWindowFontScale(1.0f);
+                    ImGui::TextUnformatted(state == 3 ? "Tell the other player this code. Waiting for them to join..." : "The other player has joined. Connecting...");
+                } else {
+                    ImGui::TextUnformatted(state == 1 ? "Found the room. Connecting to the host..." : tab == 0 ? "Getting a room code..." : "Looking for the room...");
+                }
+                if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f))) {
+                    Port_LobbyCancel();
+                    lastState = 0;
+                }
+            } else if (state == 1) {
                 if (tab == 0) {
                     ImGui::Text("Waiting for the other player on port %s...", port);
                     if (Port_LobbyOther()) {
@@ -390,7 +426,13 @@ static void build_net(void) {
                     Port_LobbyCancel();
                 }
             } else {
-                bool can = atoi(port) > 0 && (tab == 0 || address[0] != '\0');
+                if (lastState == -3) {
+                    ImGui::TextWrapped("%s", Port_LobbyError());
+                } else if (lastState == -4) {
+                    ImGui::TextWrapped("The two games could not reach each other directly: some routers and mobile connections do not allow it. "
+                                       "Hosting on a port (with port forwarding or a virtual network such as Tailscale) still works.");
+                }
+                bool can = byCode ? (tab == 0 || strlen(roomCode) == 6) : atoi(port) > 0 && (tab == 0 || address[0] != '\0');
                 ImGui::BeginDisabled(!can);
                 if (ImGui::Button(tab == 0 ? "Host a match" : "Join the match", ImVec2(200.0f, 0.0f))) {
                     if (tab == 0 && roll >= 0) {
@@ -407,7 +449,12 @@ static void build_net(void) {
                         Port_NetOptions(-1, -1); // joining: the host's choices arrive with its answer
                     }
                     Port_NetNameSet(name);
-                    Port_LobbyStart(tab == 0, address, atoi(port));
+                    lastState = 0;
+                    if (byCode) {
+                        Port_LobbyStartCode(tab == 0, roomCode);
+                    } else {
+                        Port_LobbyStart(tab == 0, address, atoi(port));
+                    }
                 }
                 ImGui::EndDisabled();
                 ImGui::SameLine();
