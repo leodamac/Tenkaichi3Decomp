@@ -866,7 +866,32 @@ Found on the way:
 - `xor_addr(attr_find(..., &len), len, ...)` read `len` before it was set: the same order-of-evaluation trap the
   bug search had listed in the game's own code.
 
-Not verified: two machines on two networks (the direct way through two real routers, and the relay where it is
+**Channels.** Once the host knows the other player's address it binds a channel to it (ChannelBind), and the
+match's packets then travel as channel data, 4 bytes longer each, instead of each inside an indication (36 bytes):
+what ICE libraries do for relayed data. `BT3_RELAY_NOCHAN=1` keeps to indications.
+
+**Two networks (the user, 2026-10-09):** a PC on a home line and one on a mobile hotspot behind carrier NAT: a room
+code connects them and the match plays; with `BT3_RELAY_ONLY=1` on the one who joins, the same through the relay,
+at full speed, ping about 30 ms. Linux and Windows. (Played with the build before channels.)
+
+**Seen and not explained: a relayed match between two copies behind one router crawls.** With both players on one
+network and the relay forced, about four matches in ten drop to some 10 blanks a second roughly ten seconds after
+they begin and stay there (the user saw it between a Windows and a Linux machine: "waited 1000 ms/s", 15 frames a
+second on both). Measured in such a match: each side sends about 220 packets a second (the lockstep's repeats
+while it waits), all through the relay, none refused by the system; each side receives 3 or 4 a second; the
+system's UDP counters show them not arriving at the machine (no drops for a full buffer). The states stay equal.
+Ruled out by experiment: the indication format (5 slow of 12 with channels bound), the host's knocking (1 slow of
+the first 5 without it), packet size, rate and content (a stand-alone sender through the same relay, game-shaped
+packets of 320 bytes at 330 a second each way for 45 seconds, several runs, the same again after a refused
+permission: all arrive). What every slow case has in common is two senders with one public address; whether the
+home router or Cloudflare limits that is not known. It does not arise in use (two players on one network reach
+each other at the local address and never use the relay) and did not happen between two networks.
+
+Not verified: a relayed match on real hardware with the channel build; a session
+longer than the login's three hours; the 32-bit build, which restarts the program for a session and so loses the
+relay address (it still connects directly).
+
+(Earlier list, before the two-network test:) Not verified then: two machines on two networks (the direct way through two real routers, and the relay where it is
 needed); real Windows (WinHTTP there, and the relay code's Windows build has only been compiled); a session
 longer than the login's three hours; the 32-bit build, which restarts the program for a session and so loses the
 relay address (it still connects directly).

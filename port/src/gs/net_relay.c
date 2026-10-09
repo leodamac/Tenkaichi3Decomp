@@ -13,7 +13,9 @@
  *                         MESSAGE-INTEGRITY: HMAC-SHA1 of the message, keyed with MD5(user ":" realm ":" password))
  *   CreatePermission   -> packets from the other player's address are let through (for five minutes: asked again)
  *   Refresh            -> the allocation lives on (ten minutes at a time: asked again)
- *   Send / Data indication -> the match's packets, 36 bytes longer each
+ *   Send / Data indication -> the match's first packets, 36 bytes longer each
+ *   ChannelBind        -> a channel to the other player's address once it is known; from then on the packets
+ *                         travel as channel data, 4 bytes longer each (BT3_RELAY_NOCHAN=1: indications only)
  * A 438 answer (stale nonce) brings a new nonce; the request is made again by the next Relay_Tick.
  *
  * BT3_RELAY_LOG=1 writes what is asked and answered to the log.
@@ -182,6 +184,9 @@ static struct {
     int permits;
     struct sockaddr_in peer;         /* the address the relay last delivered from */
     int peerVia;                     /* ... and packets to it go through the relay */
+    struct sockaddr_in chanPeer;     /* the address a channel is bound (or being bound) to */
+    int chan, chanBound;             /* its number (0x4000 and up; 0 none), and whether the server has agreed */
+    uint64_t lastBind;
     uint64_t lastRefresh, lastPermit;
 } sR;
 
@@ -407,6 +412,22 @@ static void send_permit(int sock, const struct sockaddr_in *peer) {
     to_server(sock, m, at);
 }
 
+/* Asks for a channel to `peer` (or asks again: a binding lasts ten minutes). With a channel the match's packets
+   travel with a 4-byte header in both directions, as the plain data they are, instead of each inside a STUN message
+   ("indication"): that is what a relay expects of a steady stream. */
+static void send_bind(int sock) {
+    uint8_t m[768], num[4];
+    int at = msg_begin(m, 0x0009);
+    num[0] = (uint8_t)(sR.chan >> 8);
+    num[1] = (uint8_t)sR.chan;
+    num[2] = num[3] = 0;
+    at = msg_attr(m, at, 0x000C, num, 4);
+    at = msg_addr(m, at, 0x0012, &sR.chanPeer);
+    at = msg_sign(m, at);
+    to_server(sock, m, at);
+    sR.lastBind = SDL_GetTicks();
+}
+
 void Relay_Permit(int sock, const struct sockaddr_in *peer) {
     int i;
     if (!sR.active) {
@@ -435,6 +456,9 @@ void Relay_Tick(int sock) {
         return;
     }
     now = SDL_GetTicks();
+    if (sR.chan != 0 && now - sR.lastBind > (sR.chanBound ? 240000u : 500u) && SDL_getenv("BT3_RELAY_NOCHAN") == NULL) {
+        send_bind(sock); /* not agreed yet (an answer lost): again; agreed: renewed well before it runs out */
+    }
     if (now - sR.lastPermit > 60000) { /* a permission lasts five minutes: asked again every minute (an answer may be lost) */
         sR.lastPermit = now;
         for (i = 0; i < sR.permits; i++) {
@@ -459,10 +483,29 @@ int Relay_Unwrap(uint8_t *pkt, int n, struct sockaddr_in *from, uint8_t **data, 
     if (!sR.active || !same_addr(from, &sR.server)) {
         return 2;
     }
+    if (n >= 4 && sR.chan != 0 && pkt[0] == (uint8_t)(sR.chan >> 8) && pkt[1] == (uint8_t)sR.chan) { /* channel data */
+        l = pkt[2] << 8 | pkt[3];
+        if (l > n - 4) {
+            return 0;
+        }
+        sR.peer = sR.chanPeer;
+        sR.peerVia = 1;
+        *from = sR.chanPeer;
+        *data = pkt + 4;
+        *len = l;
+        return 1;
+    }
     if (n < 20) {
         return 0;
     }
     type = (unsigned)(pkt[0] << 8 | pkt[1]);
+    if (type == 0x0109) { /* the channel is agreed */
+        sR.chanBound = 1;
+        if (SDL_getenv("BT3_RELAY_LOG") != NULL) {
+            fprintf(stderr, "relay: channel %04x bound\n", sR.chan);
+        }
+        return 0;
+    }
     if (type == 0x0017) { /* a data indication: the other player's packet */
         struct sockaddr_in peer;
         const uint8_t *d = attr_find(pkt, n, 0x0012, &l);
@@ -478,6 +521,14 @@ int Relay_Unwrap(uint8_t *pkt, int n, struct sockaddr_in *from, uint8_t **data, 
         }
         sR.peer = peer;
         sR.peerVia = 1;
+        if ((sR.chan == 0 || !same_addr(&sR.chanPeer, &peer)) && SDL_getenv("BT3_RELAY_NOCHAN") == NULL) {
+            /* the other player's address is known now: a channel to it (a new number if it is another address
+               than before: a number stays with its address) */
+            sR.chan = sR.chan == 0 ? 0x4000 : sR.chan + 1;
+            sR.chanPeer = peer;
+            sR.chanBound = 0;
+            sR.lastBind = 0; /* (asked by the next tick) */
+        }
         *from = peer;
         *data = (uint8_t *)d;
         *len = l;
@@ -515,6 +566,14 @@ void Relay_Send(int sock, const void *data, int len, const struct sockaddr_in *t
     if (len > 1400) {
         return;
     }
+    if (sR.chanBound && same_addr(to, &sR.chanPeer)) {
+        m[0] = (uint8_t)(sR.chan >> 8);
+        m[1] = (uint8_t)sR.chan;
+        put16(m + 2, (unsigned)len);
+        memcpy(m + 4, data, (size_t)len);
+        to_server(sock, m, 4 + len);
+        return;
+    }
     at = msg_begin(m, 0x0016);
     at = msg_addr(m, at, 0x0012, to);
     at = msg_attr(m, at, 0x0013, data, len);
@@ -540,4 +599,5 @@ void Relay_Close(int sock) {
     sR.active = 0;
     sR.peerVia = 0;
     sR.permits = 0;
+    sR.chan = sR.chanBound = 0;
 }

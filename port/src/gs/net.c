@@ -174,16 +174,34 @@ static unsigned sQueueHead, sQueueTail;
 /* Every packet of a match goes out and comes in through these two: the host of a match found with a room code may
    hold a relay address (net_relay.c), and then the other player's packets can arrive wrapped by the relay and must
    go back the same way. Without a relay they are plain sendto / recvfrom. */
+static int sStatOut, sStatIn, sStatInVia, sStatOutVia, sStatErr, sStatOther, sStatBytes;
+static void net_stat(void) { /* BT3_RELAY_LOG: packets out and in, a line a second */
+    static uint64_t last;
+    uint64_t now = SDL_GetTicks();
+    if (now - last >= 1000 && getenv("BT3_RELAY_LOG") != NULL) {
+        if (sStatOut + sStatIn > 0) {
+            fprintf(stderr, "bt3: net: packets out %d (%d through the relay, %d failed, %d bytes), in %d (%d through the relay, %d of the relay's own)\n", sStatOut,
+                    sStatOutVia, sStatErr, sStatBytes, sStatIn, sStatInVia, sStatOther);
+        }
+        sStatOut = sStatIn = sStatInVia = sStatOutVia = sStatErr = sStatOther = sStatBytes = 0;
+        last = now;
+    }
+}
+
 static void net_send(const void *buf, int n, const struct sockaddr_in *to) {
+    sStatOut++;
+    sStatBytes += n;
     if (Relay_IsPeer(to)) {
+        sStatOutVia++;
         Relay_Send(sSock, buf, n, to);
-    } else {
-        sendto(sSock, (const char *)buf, n, 0, (const struct sockaddr *)to, sizeof(*to));
+    } else if (sendto(sSock, (const char *)buf, n, 0, (const struct sockaddr *)to, sizeof(*to)) != n) {
+        sStatErr++;
     }
 }
 
 static int net_recv(uint8_t *pkt, int size, struct sockaddr_in *from) {
     Relay_Tick(sSock);
+    net_stat();
     for (;;) {
         socklen_t fromLen = sizeof(*from);
         uint8_t *data = NULL;
@@ -194,9 +212,15 @@ static int net_recv(uint8_t *pkt, int size, struct sockaddr_in *from) {
         kind = Relay_Unwrap(pkt, n, from, &data, &len);
         if (kind == 2) {
             Relay_SawDirect(from);
+            sStatIn++;
             return n;
         }
+        if (kind == 0) {
+            sStatOther++;
+        }
         if (kind == 1) {
+            sStatIn++;
+            sStatInVia++;
             memmove(pkt, data, (size_t)len);
             return len;
         }
@@ -1103,6 +1127,7 @@ int Port_LobbyStart(int host, const char *address, int port) {
     fcntl(sSock, F_SETFL, fcntl(sSock, F_GETFL, 0) | O_NONBLOCK);
 #endif
     sCodeMode = 0;
+    sCodeVia = 0;
     sCodeLocalPort = 0;
     sCodePunchSet = 0;
     sLobbyRole = host ? 1 : 2;

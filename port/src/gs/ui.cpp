@@ -887,7 +887,7 @@ static void meter_draw(void) {
         ImGui::Text("%.0f fps   speed %.0f%%", sFps, sSpeed);
         if (Port_NetStats(n)) {
             if (n[0] >= 0) {
-                ImGui::Text("ping %d ms", n[0]);
+                ImGui::Text("ping %d ms%s", n[0], Port_LobbyRelayed() ? " (relay)" : "");
             } else {
                 ImGui::TextUnformatted("ping ...");
             }
