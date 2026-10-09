@@ -1,8 +1,8 @@
 // Menu overlay DBZP.BIN, 0x334C00..0x339610.
 // MainMenu: the main menu screen (progress mode 4). Work area gMainMenu (0x188 bytes).
-MainMenu_StartBallLoops = 0x00334C00; // type:func
-MainMenu_Init = 0x00334CA0; // type:func
-MainMenu_Term = 0x003356B0; // type:func
+MainMenu_StartBallLoops = 0x00334C00; // type:func segment:dbzp
+MainMenu_Init = 0x00334CA0; // type:func segment:dbzp
+MainMenu_Term = 0x003356B0; // type:func segment:dbzp
 MainMenu_Draw = 0x00335728; // type:func
 MainMenu_PlateGoto = 0x00336018; // type:func
 MainMenu_Update = 0x003360B0; // type:func

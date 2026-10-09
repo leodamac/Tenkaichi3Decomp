@@ -62,7 +62,7 @@ def compile_ee(cmd, src, o):
         if BITS64:  # through LLVM IR: irfix.py repairs what the code generator cannot select for 4-byte pointers
             import irfix
             ll = pathlib.Path(str(o)[:-2] + ".ll")
-            r = subprocess.run(c2 + ["-S", "-emit-llvm", "-x", "cpp-output", str(i), "-o", str(ll)], cwd=ROOT, capture_output=True, text=True)
+            r = subprocess.run(c2 + ["-Wno-return-type", "-Wno-error=return-type", "-Wno-return-mismatch", "-S", "-emit-llvm", "-x", "cpp-output", str(i), "-o", str(ll)], cwd=ROOT, capture_output=True, text=True)
             if r.returncode:
                 return r
             text, _ = irfix.fix(ll.read_text())

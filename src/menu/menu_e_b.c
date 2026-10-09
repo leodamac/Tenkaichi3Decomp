@@ -1943,6 +1943,7 @@ f32 TeamSel_Input(s32 *result) {
             }
         }
     }
+    return 0.0f;
 }
 
 /*

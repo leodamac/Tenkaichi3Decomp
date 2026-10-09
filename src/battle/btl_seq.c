@@ -493,6 +493,7 @@ u16 *BtlText_FindEntry(s32 n) {
         p = BtlText_NextLine(p);
     }
     return ret;
+    return ret;
 }
 
 /* Draws the name of entry n at (x, y); align 0 / 1 / other picks the font alignment 0 / 2 / 1. */

@@ -83,8 +83,9 @@ s32 BtlAct_Throw(BtlActHChr *chr, s32 phase) {
     if (phase == 3) {
         BtlChar_SetFlag(chr, 0x8C);
         BtlChar_SetFlag(chr, 0x33);
-        return;
+        return 0;
     }
+    return 0;
 }
 
 /*
@@ -137,9 +138,10 @@ s32 BtlAct_Thrown(BtlActHChr *chr, s32 phase) {
         BtlChar_SetFlag(chr, 0x33);
         if (!(chr->work[0] & 1)) {
             BtlActThrow_SetReleaseHeading(chr);
-            return;
+            return 0;
         }
     }
+    return 0;
 }
 
 /*
@@ -730,8 +732,9 @@ s32 BtlAct_TransformA(BtlActHChr *chr, s32 phase) {
         BtlChar_SetFlag(chr, 0x37);
         BtlEvent_Raise(chr->player, 0x4D);
         BtlChar_AddStageTimer(2.0f);
-        return;
+        return 0;
     }
+    return 0;
 }
 
 /*
