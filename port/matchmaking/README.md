@@ -47,6 +47,34 @@ Without the two secrets the Worker works as before, without a relay. The key nev
 handed a name and password that are good for three hours. Cloudflare's TURN is free for the first 1,000 GB a month
 (a match is about 50 MB an hour, and only matches that cannot connect directly use it).
 
+## A ceiling on the relay's use
+
+Cloudflare has no spending limit for its TURN service (a budget alert only sends an e-mail, a day late), and a
+relay login lets its holder send as much as they like for three hours. So the Worker measures the relay's use
+itself, from Cloudflare's analytics, every five minutes:
+
+- a login that has passed more than 1 GB in three hours is ended at once (a match is about 0.05 GB an hour;
+  variable `TURN_LOGIN_GB`);
+- when the calendar month's use reaches 500 GB (variable `TURN_MONTHLY_GB`; Cloudflare charges after 1,000),
+  every login in use is ended and no more are given until the next month. Rooms go on working, without a relay.
+
+Both directions are counted, which is more than is charged for. The analytics run some minutes behind, so the
+ceiling can be passed by what flows in that time. To set it up:
+
+1. Variable `CF_ACCOUNT_ID`: the account's ID (Workers & Pages overview, on the right).
+2. Secret `CF_ANALYTICS_TOKEN`: an API token (My Profile -> API Tokens -> Create Token -> custom) with the single
+   permission Account -> Account Analytics -> Read.
+3. Secret `ADMIN_KEY`: 16 or more characters of your own choosing, for the status check below.
+4. Settings -> Trigger Events -> Cron Trigger: `*/5 * * * *`.
+
+Once `CF_ACCOUNT_ID` or `CF_ANALYTICS_TOKEN` is set, no relay login is given unless a measurement has succeeded in
+the last two hours: a ceiling that cannot be checked is not relied on. To measure at once and see the result:
+
+    curl -s -X POST $W/v1/status -d '{"admin":"<your ADMIN_KEY>"}'
+
+answers for instance `{"measured":true,"monthGB":0.42,"limitGB":500,"relay":"on","loginsSeen":3,"loginsEnded":0,
+"loginsToday":7,...}`, or `"measured":false` and why.
+
 ## What a player is told about the other
 
 The name, the public address and port, and for the one who joins the host's relay address. An address of a
@@ -60,7 +88,7 @@ Anyone can send requests to a Worker, so it counts (table `used`):
 
 - an address may make 20 rooms an hour and have 4 open at a time;
 - an address may enter 30 codes an hour that name no room (codes are not to be found by trying);
-- an address is given at most 30 relay logins a day, and all addresses together 2,000 a day (the variable
+- an address is given at most 10 relay logins a day, and all addresses together 500 a day (the variable
   `TURN_DAILY_MAX` sets another number). Past that, rooms still work, without a relay. This is the ceiling on what
   the relay can be made to cost: a login lets its holder send through the relay for three hours.
 

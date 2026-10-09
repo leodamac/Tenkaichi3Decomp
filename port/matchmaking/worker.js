@@ -25,9 +25,17 @@ const ROOM_SECONDS = 600;       // a room nobody joined disappears after ten min
 const ROOMS_PER_ADDRESS = 4;    // rooms one address may have open at a time
 const WRONG_CODES_PER_HOUR = 30; // codes that name no room, from one address in an hour
 const HOSTS_PER_HOUR = 20;      // rooms one address may make in an hour
-const RELAY_PER_DAY_ADDRESS = 30; // relay logins one address may be given in a day
-const RELAY_PER_DAY = 2000;     // relay logins given in a day, all told (the variable TURN_DAILY_MAX overrides it): the
+const RELAY_PER_DAY_ADDRESS = 10; // relay logins one address may be given in a day
+const RELAY_PER_DAY = 500;      // relay logins given in a day, all told (the variable TURN_DAILY_MAX overrides it): the
                                 // ceiling on what the relay can be made to cost, whatever anyone sends
+// The relay's use is measured (see relayCheck) when the Worker is given the means: the variable CF_ACCOUNT_ID and the
+// secret CF_ANALYTICS_TOKEN (an API token with "Account Analytics: Read"), and a Cron Trigger every five minutes.
+const RELAY_MONTH_GB = 500;     // bytes through the relay in a calendar month after which no more logins are given
+                                // and those in use are ended (the variable TURN_MONTHLY_GB overrides it). Cloudflare
+                                // charges after 1,000 GB.
+const RELAY_LOGIN_GB = 1;       // one login that has passed this much in three hours is ended (a match is about
+                                // 0.05 GB an hour; the variable TURN_LOGIN_GB overrides it)
+const CHECK_STALE = 2 * 3600;   // with measuring set up: no logins when no measurement has succeeded for this long
 const ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // no I, L, O, 0, 1: they are misread
 
 function reply(body, status = 200) {
@@ -134,8 +142,104 @@ async function countUse(env, what, slot) {
     }
 }
 
+// A kept number: the value of `what` in `slot` (null if there is none), and setting it.
+async function getValue(env, what, slot) {
+    try {
+        const row = await env.DB.prepare("SELECT n FROM used WHERE what = ? AND slot = ?").bind(what, slot).first();
+        return row ? row.n : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+async function setValue(env, what, slot, n) {
+    await env.DB.prepare("INSERT INTO used (what, slot, n) VALUES (?, ?, ?) ON CONFLICT(what, slot) DO UPDATE SET n = excluded.n").bind(what, slot, n).run();
+}
+
+function monthStart(now) {
+    const d = new Date(now * 1000);
+    return Math.floor(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1) / 1000);
+}
+
+function measuring(env) {
+    return Boolean(env.CF_ACCOUNT_ID && env.CF_ANALYTICS_TOKEN && env.TURN_KEY_ID && env.TURN_KEY_TOKEN);
+}
+
+// Ends one relay login at once.
+async function revoke(env, username) {
+    try {
+        const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/${encodeURIComponent(username)}/revoke`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${env.TURN_KEY_TOKEN}` },
+        });
+        return r.ok;
+    } catch (e) {
+        return false;
+    }
+}
+
+// Measures what has gone through the relay (Cloudflare's analytics, minutes behind) and acts on it: a login that has
+// passed more than a match ever would is ended; past the month's limit every login in use is ended and no more are
+// given until the next month. Run by the Cron Trigger, and by /v1/status. Returns what it found.
+async function relayCheck(env, now) {
+    if (!measuring(env)) {
+        return { measured: false, why: "CF_ACCOUNT_ID and CF_ANALYTICS_TOKEN are not both set" };
+    }
+    const account = String(env.CF_ACCOUNT_ID).replace(/[^0-9a-f]/gi, ""), keyId = String(env.TURN_KEY_ID).replace(/[^0-9a-z]/gi, "");
+    const month = monthStart(now), iso = (t) => new Date(t * 1000).toISOString().slice(0, 19) + "Z";
+    const part = (name, from, extra) => `${name}: callsTurnUsageAdaptiveGroups(filter: { datetime_geq: "${iso(from)}", datetime_leq: "${iso(now)}", keyId: "${keyId}" }, ${extra}) { sum { egressBytes ingressBytes } dimensions { ${name === "logins" ? "username" : "keyId"} } }`;
+    const query = `query { viewer { accounts(filter: { accountTag: "${account}" }) { ${part("month", month, "limit: 10")} ${part("logins", now - 3 * 3600, "limit: 500, orderBy: [sum_egressBytes_DESC]")} } } }`;
+    let data;
+    try {
+        const r = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+            method: "POST",
+            headers: { authorization: `Bearer ${env.CF_ANALYTICS_TOKEN}`, "content-type": "application/json" },
+            body: JSON.stringify({ query }),
+        });
+        const j = await r.json();
+        if (!r.ok || (j.errors && j.errors.length) || !j.data) {
+            return { measured: false, why: "the analytics answered " + r.status + ": " + JSON.stringify(j.errors ?? j).slice(0, 300) };
+        }
+        data = j.data.viewer.accounts[0];
+    } catch (e) {
+        return { measured: false, why: "the analytics could not be asked: " + String(e).slice(0, 200) };
+    }
+    if (!data) {
+        return { measured: false, why: "the analytics know no such account (CF_ACCOUNT_ID)" };
+    }
+    // both directions are counted: more than Cloudflare may charge for, so the limit is reached early rather than late
+    const bytes = (g) => (g.sum.egressBytes ?? 0) + (g.sum.ingressBytes ?? 0);
+    const monthBytes = (data.month ?? []).reduce((n, g) => n + bytes(g), 0);
+    const monthLimit = (Number(env.TURN_MONTHLY_GB) || RELAY_MONTH_GB) * 1e9, loginLimit = (Number(env.TURN_LOGIN_GB) || RELAY_LOGIN_GB) * 1e9;
+    const over = monthBytes >= monthLimit;
+    let ended = 0;
+    for (const g of data.logins ?? []) {
+        const name = g.dimensions.username;
+        if (name && (over || bytes(g) >= loginLimit) && (await getValue(env, "ended:" + name, 0)) === null) {
+            if (await revoke(env, name)) {
+                await setValue(env, "ended:" + name, 0, now);
+                ended++;
+            }
+        }
+    }
+    if (over) {
+        await setValue(env, "relayoff", month, 1);
+    }
+    await setValue(env, "checked", 0, now);
+    return { measured: true, monthGB: Math.round(monthBytes / 1e7) / 100, limitGB: monthLimit / 1e9, relay: over ? "off until next month" : "on", loginsSeen: (data.logins ?? []).length, loginsEnded: ended };
+}
+
 // Whether this address may be given a relay login now (and counts it), or why not.
 async function relayAllowed(env, ip, now) {
+    if ((await getValue(env, "relayoff", monthStart(now))) !== null) {
+        return "the month's relay allowance is used up";
+    }
+    if (env.CF_ACCOUNT_ID || env.CF_ANALYTICS_TOKEN) {
+        const checked = await getValue(env, "checked", 0);
+        if (checked === null || now - checked > CHECK_STALE) {
+            return "the relay's use could not be measured lately: no logins until it can (see /v1/status)";
+        }
+    }
     const day = now - (now % 86400);
     const all = await countUse(env, "relay", day);
     if (all === 0) {
@@ -200,6 +304,13 @@ export default {
         const now = Math.floor(Date.now() / 1000);
         const what = url.pathname.slice(4);
 
+        if (what === "status") { // for whoever runs the Worker: measures now and says what it found (no secrets in it)
+            if (!env.ADMIN_KEY || String(env.ADMIN_KEY).length < 16 || body.admin !== env.ADMIN_KEY) {
+                return reply({ error: "bad request" }, 404);
+            }
+            const day = now - (now % 86400);
+            return reply({ ...(await relayCheck(env, now)), loginsToday: (await getValue(env, "relay", day)) ?? 0, lastMeasured: await getValue(env, "checked", 0) });
+        }
         if (what === "host") {
             const addrs = cleanAddrs(body.addrs);
             if (!Number.isInteger(body.v) || addrs === null) {
@@ -214,7 +325,8 @@ export default {
                 return reply({ error: "busy" }, 429);
             }
             if (now % 50 === 0) { // now and then: counts of past days are thrown away
-                await env.DB.prepare("DELETE FROM used WHERE slot < ?").bind(now - 2 * 86400).run().catch(() => {});
+                await env.DB.prepare("DELETE FROM used WHERE slot < ? AND slot > 0 AND what != 'relayoff'").bind(now - 2 * 86400).run().catch(() => {});
+                await env.DB.prepare("DELETE FROM used WHERE slot = 0 AND what LIKE 'ended:%' AND n < ?").bind(now - 2 * 86400).run().catch(() => {});
             }
             const key = randomText(24, ALPHABET);
             for (let attempt = 0; attempt < 5; attempt++) {
@@ -299,5 +411,10 @@ export default {
             return reply({});
         }
         return reply({ error: "bad request" }, 404);
+    },
+
+    // the Cron Trigger: the relay's use is measured
+    async scheduled(event, env, ctx) {
+        ctx.waitUntil(relayCheck(env, Math.floor(Date.now() / 1000)));
     },
 };

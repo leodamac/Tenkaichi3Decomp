@@ -18,6 +18,7 @@ const DB = { prepare(sql) { return { args: [], bind(...a) { this.args = a; retur
     async run() { const a = this.args;
         if (sql.startsWith("DELETE FROM rooms WHERE made")) { for (const [k, r] of rooms) { if (r.made < a[0]) rooms.delete(k); } return {}; }
         if (sql.startsWith("DELETE FROM used")) { return {}; }
+        if (sql.startsWith("INSERT INTO used")) { used.set(a[0] + "|" + a[1], a[2]); return {}; }
         if (sql.startsWith("INSERT INTO rooms")) { if (rooms.has(a[0])) throw new Error("taken"); rooms.set(a[0], { code: a[0], made: a[1], version: a[2], ip: a[3], host_key: a[4], join_key: null, host_name: a[5], join_name: null, host_addrs: a[6], join_addrs: null }); return {}; }
         if (sql.startsWith("UPDATE rooms SET join_key")) { const r = rooms.get(a[3]); if (!r || r.join_key !== null) return { meta: { changes: 0 } }; r.join_key = a[0]; r.join_name = a[1]; r.join_addrs = a[2]; return { meta: { changes: 1 } }; }
         if (sql.startsWith("UPDATE rooms SET host_addrs")) { rooms.get(a[1]).host_addrs = a[0]; return {}; }
@@ -62,5 +63,46 @@ check("... and so is a right code from that address", last.error === "busy");
 for (let i = 0; i < 21; i++) { last = await post("host", "192.0.2.50", { v: 3, name: "H", addrs: ["192.0.2.50:1"] }); if (last.code) await post("leave", "192.0.2.50", { code: last.code, key: last.key }); }
 check("the 21st room in an hour from one address is refused", last.error === "busy");
 check("no relay without a key says why", typeof h.noRelay === "string");
+// the relay's use measured: Cloudflare's analytics and its TURN service stood in for
+const cap = { DB, TURN_KEY_ID: "abc123", TURN_KEY_TOKEN: "t", CF_ACCOUNT_ID: "0123abcd", CF_ANALYTICS_TOKEN: "a", ADMIN_KEY: "0123456789abcdef0123" };
+let monthBytes = 10e9, analyticsFail = false;
+const revoked = [];
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (u, init) => {
+    u = String(u);
+    if (u.includes("/graphql")) {
+        if (analyticsFail) { return new Response(JSON.stringify({ data: null, errors: [{ message: "not allowed" }] }), { status: 200 }); }
+        return new Response(JSON.stringify({ data: { viewer: { accounts: [{ month: [{ sum: { egressBytes: monthBytes / 2, ingressBytes: monthBytes / 2 }, dimensions: { keyId: "abc123" } }],
+            logins: [{ sum: { egressBytes: 1.5e9, ingressBytes: 0.5e9 }, dimensions: { username: "heavy" } }, { sum: { egressBytes: 5e7, ingressBytes: 5e7 }, dimensions: { username: "light" } }] }] } } }));
+    }
+    if (u.endsWith("/revoke")) { revoked.push(u.split("/credentials/")[1].split("/")[0]); return new Response(null, { status: 204 }); }
+    if (u.includes("generate-ice-servers")) { return new Response(JSON.stringify({ iceServers: [{ urls: ["turn:turn.example:3478?transport=udp"], username: "u", credential: "c" }] })); }
+    return realFetch(u, init);
+};
+async function postCap(what, ip, body) {
+    const r = await worker.fetch(new Request("https://x/v1/" + what, { method: "POST", headers: { "cf-connecting-ip": ip }, body: JSON.stringify(body) }), cap);
+    return r.json();
+}
+h = await postCap("host", "192.0.2.90", { v: 3, name: "H", addrs: ["192.0.2.90:1"] });
+check("measuring set up but never done: no relay login", typeof h.noRelay === "string" && h.noRelay.includes("measured"));
+check("status needs the admin key", (await postCap("status", "192.0.2.90", { admin: "wrong" })).error === "bad request");
+analyticsFail = true;
+let st = await postCap("status", "192.0.2.90", { admin: cap.ADMIN_KEY });
+check("analytics refusing: reported, nothing measured", st.measured === false && st.why.includes("not allowed"));
+analyticsFail = false;
+st = await postCap("status", "192.0.2.90", { admin: cap.ADMIN_KEY });
+check("under the limit: relay on, 10 GB counted", st.measured === true && st.relay === "on" && st.monthGB === 10);
+check("the login that passed 2 GB is ended, the light one is not", JSON.stringify(revoked) === JSON.stringify(["heavy"]));
+h = await postCap("host", "192.0.2.91", { v: 3, name: "H", addrs: ["192.0.2.91:1"] });
+check("after a measurement: a relay login is given", h.turn && h.turn.username === "u");
+st = await postCap("status", "192.0.2.90", { admin: cap.ADMIN_KEY });
+check("a login is ended once only", revoked.length === 1);
+monthBytes = 600e9;
+st = await postCap("status", "192.0.2.90", { admin: cap.ADMIN_KEY });
+check("past the month's limit: relay off, every login in use ended", st.relay === "off until next month" && revoked.includes("light"));
+h = await postCap("host", "192.0.2.92", { v: 3, name: "H", addrs: ["192.0.2.92:1"] });
+check("... and no more logins, rooms still made", typeof h.code === "string" && h.noRelay === "the month's relay allowance is used up");
+await worker.scheduled({}, cap, { waitUntil: (p) => p });
+check("the Cron Trigger's entry runs", true);
 console.log(fails === 0 ? "all passed" : fails + " failed");
 process.exit(fails === 0 ? 0 : 1);
