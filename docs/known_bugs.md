@@ -83,7 +83,7 @@ purpose. Each is confirmed by C that compiles to the original bytes unless marke
   memory stores). Visual only; a port should zero these and accept that the PS2's result
   depended on stack junk.
 
-## Port only: a tournament match crashed for some players (fixed after 0.1.16)
+## Port only: a tournament match crashed for some players (fixed in 0.1.17)
 
 Reported on Windows with 0.1.16: starting a World Tournament match crashed in `BattleSetup_SetSide`, "reading
 address 0xFFFFFFFFFFFFFFFF", called from `Bracket_SetupBattle`. It did not happen on the user's own machine.
@@ -100,5 +100,6 @@ Fix: the three declarations say `void *`; the caller now writes 64 bits (`movq`)
 lists every function declared with a pointer in one place and a 32-bit integer in another (78 of them): this was
 the only one in an argument passed on the stack on both systems (the fifth and later on Windows, the seventh and
 later on Linux). The others are in registers, where a 32-bit write clears the upper half, or are return values.
-Not verified: the reporting player's machine with the fix.
+The reporting player, for whom it crashed with every character every time, confirmed that a build with the fix
+starts the match (2026-10-09). Released in 0.1.17.
 
