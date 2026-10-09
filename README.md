@@ -23,7 +23,8 @@ game's data from it, and it stays on your computer.
 - Music, voices and sound effects; keyboard and controllers, fully rebindable; two players.
 - Clashes: Square counts as a direction (off by default; F1, Controls): in a clash of two beams or two rushes the
   game counts newly pressed directions, which is why the stick is turned; with this each press of Square counts as
-  one, as a tap of the d-pad does. It changes only your own pad, so it can be used online.
+  one, as a tap of the d-pad does. It changes only your own pad, so it can be used online. A press can be made to
+  count for 1, 1.5, 1.75 or 2 (1.75 unless set: the d-pad has four buttons to tap in turn, Square is one).
 - Texture packs made for PCSX2 (`.dds` or `.png`): copied into the `textures` folder next to the game, they are used as they are.
 - Stages and music from outside the disc: a stage model (`.unk`) dropped into the `stages` folder next to the
   game, or a song (`.adx`) into `songs`, is added to the stage select, its name written in the game's own

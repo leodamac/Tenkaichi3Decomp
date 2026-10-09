@@ -230,6 +230,13 @@ static unsigned char axis(SDL_Gamepad *g, SDL_GamepadAxis a) {
  * next of up, right, down, left for as long as it is held: one press, one newly pressed direction, as a tap of
  * the d-pad gives. The stick and the d-pad go on working beside it.
  *
+ * A press can be made to count for more than one (setting clash_square_x, in quarters: 4, 6, 7 or 8 for 1, 1.5,
+ * 1.75 or 2; 1.75 unless set; BT3_CLASH_SQUARE_X): the d-pad has four buttons to tap in turn and the stick four
+ * directions a turn, Square is one button. What a press is worth beyond one is kept as credit, and whenever a
+ * whole point of it is owed the stick is put in the next direction for one frame without a press: four presses at
+ * 1.75 give 2, 2, 2, 1. Still at most one newly pressed direction a frame, the game's own limit, and credit does
+ * not pile up beyond two points or outlast the clash.
+ *
  * This is done to the pad's own bytes, before they reach the game or the other player of an online match: the
  * game sees an ordinary pad, so the two copies of an online match compute the same fight whoever has it on. */
 static int sClashSquare = -1;
@@ -239,6 +246,22 @@ int Port_ClashSquare(void) {
         sClashSquare = getenv("BT3_CLASH_SQUARE") != NULL ? atoi(getenv("BT3_CLASH_SQUARE")) != 0 : Port_Setting("clash_square", 0) != 0;
     }
     return sClashSquare;
+}
+
+/* What a press of Square is worth in a clash, in quarters of a point (4, 6, 7 or 8). */
+static int sClashSquareX = -1;
+
+int Port_ClashSquareX(void) {
+    if (sClashSquareX < 0) {
+        int x = getenv("BT3_CLASH_SQUARE_X") != NULL ? atoi(getenv("BT3_CLASH_SQUARE_X")) : Port_Setting("clash_square_x", 7);
+        sClashSquareX = x == 4 || x == 6 || x == 7 || x == 8 ? x : 7;
+    }
+    return sClashSquareX;
+}
+
+void Port_ClashSquareXSet(int quarters) {
+    sClashSquareX = quarters == 4 || quarters == 6 || quarters == 8 ? quarters : 7;
+    Port_SettingSave("clash_square_x", sClashSquareX);
 }
 
 void Port_ClashSquareSet(int on) {
@@ -251,8 +274,8 @@ static void clash_square(int socket, unsigned *btn, unsigned char *lx, unsigned 
     extern void *BtlChar_FindByObjId(int objId); /* the game: the fighter of a side, NULL outside a fight */
     extern int BtlAct_GetCurrent(void *chr);     /* its action */
     extern int Port_NetActive(void), Port_NetMe(void);
-    static int dir[2], was[2];
-    int side = Port_NetActive() ? Port_NetMe() : socket, in = 0, down = (*btn & B_SQUARE) != 0;
+    static int dir[2], was[2], credit[2]; /* (credit: quarters of a point owed beyond the press's own) */
+    int side = Port_NetActive() ? Port_NetMe() : socket, in = 0, down = (*btn & B_SQUARE) != 0, extra = 0;
     void *chr;
 
     if (!Port_ClashSquare()) {
@@ -266,14 +289,23 @@ static void clash_square(int socket, unsigned *btn, unsigned char *lx, unsigned 
     }
     if (!in) {
         was[socket] = down; /* (a Square held into the clash is not a press in it) */
+        credit[socket] = 0;
         return;
     }
     if (down && !was[socket]) {
         dir[socket] = (dir[socket] + 1) & 3;
+        credit[socket] += Port_ClashSquareX() - 4;
+        if (credit[socket] > 8) {
+            credit[socket] = 8;
+        }
+    } else if (credit[socket] >= 4) { /* a whole point is owed: the next direction for this frame, without a press */
+        dir[socket] = (dir[socket] + 1) & 3;
+        credit[socket] -= 4;
+        extra = 1;
     }
     was[socket] = down;
     *btn &= ~(unsigned)B_SQUARE;
-    if (down) {
+    if (down || extra) {
         switch (dir[socket]) {
         case 0: *ly = 0x00; break; /* up */
         case 1: *lx = 0xFF; break; /* right */

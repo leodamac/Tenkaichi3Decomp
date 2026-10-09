@@ -42,6 +42,8 @@ int Port_Setting(const char *name, int def);   // plat_settings.c
 void Port_SettingSave(const char *name, int value);
 int Port_ClashSquare(void);                    // gs_input.c: Square counts as a direction in clashes
 void Port_ClashSquareSet(int on);
+int Port_ClashSquareX(void);                   // what a press is worth, in quarters of a point (4, 6, 7, 8)
+void Port_ClashSquareXSet(int quarters);
 extern int gsInterp;                           // gs_draw.c: in-between pictures on (1) / off (0); -1 before the first frame
 void Port_SettingsWrite(void);
 int Port_LobbyStart(int host, const char *address, int port); // gs/net.c
@@ -802,6 +804,24 @@ static void build(void) {
                                       "turning the stick, or tapping the d-pad. With this on, each press of Square\n"
                                       "counts as one of them while the clash lasts, as a tap of the d-pad does.\n"
                                       "It only changes your own pad, so it can be used in online play.");
+                if (cs) {
+                    static const int kQuarters[] = {4, 6, 7, 8};
+                    static const char *const kWorth[] = {"1", "1.5", "1.75", "2"};
+                    int at = 2;
+                    for (int i = 0; i < 4; i++) {
+                        if (kQuarters[i] == Port_ClashSquareX()) {
+                            at = i;
+                        }
+                    }
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(80.0f);
+                    if (ImGui::Combo("per press", &at, kWorth, 4)) {
+                        Port_ClashSquareXSet(kQuarters[at]);
+                    }
+                    ImGui::SetItemTooltip("What one press of Square is worth. The d-pad has four buttons to tap in turn and the\n"
+                                          "stick four directions a turn; Square is one button. 1 is a single d-pad tap.\n"
+                                          "Never more than one a frame, which is the most the game counts from any pad.");
+                }
                 ImGui::Separator();
                 controls_tab();
                 ImGui::EndTabItem();
