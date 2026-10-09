@@ -23,6 +23,10 @@
 
 const ROOM_SECONDS = 600;       // a room nobody joined disappears after ten minutes
 const ROOMS_PER_ADDRESS = 4;    // rooms one address may have open at a time
+const HOSTS_PER_HOUR = 20;      // rooms one address may make in an hour
+const RELAY_PER_DAY_ADDRESS = 30; // relay logins one address may be given in a day
+const RELAY_PER_DAY = 2000;     // relay logins given in a day, all told (the variable TURN_DAILY_MAX overrides it): the
+                                // ceiling on what the relay can be made to cost, whatever anyone sends
 const ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // no I, L, O, 0, 1: they are misread
 
 function reply(body, status = 200) {
@@ -56,6 +60,34 @@ function cleanAddrs(addrs) {
         }
     }
     return out.length > 0 ? out : null;
+}
+
+// Counts one more use of `what` in the time slot that starts at `slot` (seconds) and says how many that makes; 0 if
+// the count could not be kept (the table "used" is missing: see schema.sql).
+async function countUse(env, what, slot) {
+    try {
+        const row = await env.DB.prepare("INSERT INTO used (what, slot, n) VALUES (?, ?, 1) ON CONFLICT(what, slot) DO UPDATE SET n = n + 1 RETURNING n")
+            .bind(what, slot).first();
+        return row ? row.n : 0;
+    } catch (e) {
+        return 0;
+    }
+}
+
+// Whether this address may be given a relay login now (and counts it), or why not.
+async function relayAllowed(env, ip, now) {
+    const day = now - (now % 86400);
+    const all = await countUse(env, "relay", day);
+    if (all === 0) {
+        return "the Worker cannot count relay logins (the table 'used' is missing): none are given";
+    }
+    if (all > (Number(env.TURN_DAILY_MAX) || RELAY_PER_DAY)) {
+        return "the day's relay logins are used up";
+    }
+    if ((await countUse(env, "relay:" + ip, day)) > RELAY_PER_DAY_ADDRESS) {
+        return "too many relay logins for this address today";
+    }
+    return null;
 }
 
 // Short-lived access to Cloudflare's TURN service for one host: {server, username, credential}, or {why} saying what
@@ -118,13 +150,20 @@ export default {
             if (open && open.n >= ROOMS_PER_ADDRESS) {
                 return reply({ error: "busy" }, 429);
             }
+            if ((await countUse(env, "host:" + ip, now - (now % 3600))) > HOSTS_PER_HOUR) {
+                return reply({ error: "busy" }, 429);
+            }
+            if (now % 50 === 0) { // now and then: counts of past days are thrown away
+                await env.DB.prepare("DELETE FROM used WHERE slot < ?").bind(now - 2 * 86400).run().catch(() => {});
+            }
             const key = randomText(24, ALPHABET);
             for (let attempt = 0; attempt < 5; attempt++) {
                 const code = randomText(6, ALPHABET);
                 try {
                     await env.DB.prepare("INSERT INTO rooms (code, made, version, ip, host_key, host_name, host_addrs) VALUES (?, ?, ?, ?, ?, ?, ?)")
                         .bind(code, now, body.v, ip, key, cleanName(body.name), JSON.stringify(addrs)).run();
-                    const turn = await turnAccess(env);
+                    const refused = await relayAllowed(env, ip, now);
+                    const turn = refused ? { why: refused } : await turnAccess(env);
                     return reply(turn.server ? { code, key, you: ip, turn } : { code, key, you: ip, noRelay: turn.why });
                 } catch (e) {
                     // the code is taken: another one

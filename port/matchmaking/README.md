@@ -47,6 +47,20 @@ Without the two secrets the Worker works as before, without a relay. The key nev
 handed a name and password that are good for three hours. Cloudflare's TURN is free for the first 1,000 GB a month
 (a match is about 50 MB an hour, and only matches that cannot connect directly use it).
 
+## Limits against abuse
+
+Anyone can send requests to a Worker, so it counts (table `used`):
+
+- an address may make 20 rooms an hour and have 4 open at a time;
+- an address is given at most 30 relay logins a day, and all addresses together 2,000 a day (the variable
+  `TURN_DAILY_MAX` sets another number). Past that, rooms still work, without a relay. This is the ceiling on what
+  the relay can be made to cost: a login lets its holder send through the relay for three hours.
+
+Without the table `used` no relay logins are given at all (rooms work). What the counts do not prevent: many
+addresses using up the Worker's own daily requests (100,000 on the free plan; matchmaking then stops until the
+next day, at no cost). If a relay key is abused, deleting it (Realtime -> TURN Server) ends every login made from
+it at once. A billing notification in the dashboard is worth setting.
+
 ## Trying it by hand
 
     W=https://<worker>.<subdomain>.workers.dev

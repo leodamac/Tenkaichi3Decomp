@@ -413,9 +413,10 @@ static int SDLCALL match_thread(void *arg) {
         sM.st.state = 2;
         SDL_UnlockMutex(sM.lock);
         SDL_snprintf(body, sizeof(body), "{\"code\":\"%s\",\"key\":\"%s\"}", sM.code, key);
-        for (i = 0; i < 290 && !STOPPED(); i++) { /* a room lasts ten minutes */
+        for (i = 0; i < 165 && !STOPPED(); i++) { /* a room lasts ten minutes */
             int k;
-            for (k = 0; k < 20 && !STOPPED(); k++) {
+            /* asked every two seconds in the first minute, every four after it (the service's daily requests) */
+            for (k = 0; k < (i < 30 ? 20 : 40) && !STOPPED(); k++) {
                 SDL_Delay(100);
             }
             if (STOPPED()) {
