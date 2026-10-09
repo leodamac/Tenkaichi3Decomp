@@ -35,7 +35,7 @@ game's data from it, and it stays on your computer.
 
 - **Online play, experimental** (from release 0.1.8): the main menu's hidden "Dragon Net Battle"
   entry is back and opens a small window. One player hosts and gets a six-character room code, the other joins
-  with the code: no port forwarding (hosting on a port and joining by address is still there);
+  with the code: no port forwarding (from 0.1.16; hosting on a port and joining by address is still there);
   both get the same roster with everything unlocked, each sees their own fighter's view full screen, and leaving
   the match puts each player back where they were with their own save. Linux and Windows play against each
   other. With rollback (the host chooses how many frames, and the input delay) your own moves come out at once
