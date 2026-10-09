@@ -82,3 +82,23 @@ purpose. Each is confirmed by C that compiles to the original bytes unless marke
   passed to `EftSmoke_Create`, from byte +76), `HudGauge_UpdateAura` (u16 locals reaching
   memory stores). Visual only; a port should zero these and accept that the PS2's result
   depended on stack junk.
+
+## Port only: a tournament match crashed for some players (fixed after 0.1.16)
+
+Reported on Windows with 0.1.16: starting a World Tournament match crashed in `BattleSetup_SetSide`, "reading
+address 0xFFFFFFFFFFFFFFFF", called from `Bracket_SetupBattle`. It did not happen on the user's own machine.
+
+Cause (verified in the release program's code): three menu headers (`menu_i.h`, `menu_l.h`, `menu_q.h`) declared the
+function's eighth argument, a pointer to the usable-character bits, as `s32`. The callers pass 0 for it. On the PS2
+both are 32 bits and nothing is wrong. In a 64-bit build the eighth argument travels on the stack: the caller,
+believing it an `s32`, wrote 32 bits of zero (`movl $0, 0x38(%rsp)`) and the function read 64, the upper half
+being whatever the stack held. When that was not zero the function took it for a pointer and read through it.
+Whether it crashed depended on what had run before, which is why it was not seen everywhere. The same wrong
+declaration was used by the callers in `menu_h_d.c` (training) and `menu_q_b.c` (Sim Dragon).
+
+Fix: the three declarations say `void *`; the caller now writes 64 bits (`movq`). `port/tools/proto_check.py`
+lists every function declared with a pointer in one place and a 32-bit integer in another (78 of them): this was
+the only one in an argument passed on the stack on both systems (the fifth and later on Windows, the seventh and
+later on Linux). The others are in registers, where a 32-bit write clears the upper half, or are return values.
+Not verified: the reporting player's machine with the fix.
+
