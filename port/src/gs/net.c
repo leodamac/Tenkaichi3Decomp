@@ -285,6 +285,9 @@ static int receive(void) {
         if (magic != MAGIC) {
             continue;
         }
+        if (sConnected && (from.sin_addr.s_addr != sPeer.sin_addr.s_addr || from.sin_port != sPeer.sin_port)) {
+            continue; /* a match takes packets from the other player's address only: nobody else can end it or put buttons in */
+        }
         got = 1;
         if (type == T_PING && n >= 12) { /* setting up: sent back as it came, for the round trip time */
             uint32_t pong[3] = {MAGIC, T_PONG, 0};
