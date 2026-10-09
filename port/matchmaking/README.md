@@ -69,6 +69,11 @@ addresses using up the Worker's own daily requests (100,000 on the free plan; ma
 next day, at no cost). If a relay key is abused, deleting it (Realtime -> TURN Server) ends every login made from
 it at once. A billing notification in the dashboard is worth setting.
 
+## Testing a change
+
+`node port/matchmaking/test.mjs` runs the Worker's code against a small stand-in for its database: who is told
+which addresses, and the limits. Nothing is sent anywhere.
+
 ## Trying it by hand
 
     W=https://<worker>.<subdomain>.workers.dev
