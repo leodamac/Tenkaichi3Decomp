@@ -47,11 +47,19 @@ Without the two secrets the Worker works as before, without a relay. The key nev
 handed a name and password that are good for three hours. Cloudflare's TURN is free for the first 1,000 GB a month
 (a match is about 50 MB an hour, and only matches that cannot connect directly use it).
 
+## What a player is told about the other
+
+The name, the public address and port, and for the one who joins the host's relay address. An address of a
+private network (192.168.x.x and the like) is handed over only when the two are on one network: seen by the
+Worker under the same address (the same network part, for IPv6), or with the same public IPv4 address in what the
+games found out themselves.
+
 ## Limits against abuse
 
 Anyone can send requests to a Worker, so it counts (table `used`):
 
 - an address may make 20 rooms an hour and have 4 open at a time;
+- an address may enter 30 codes an hour that name no room (codes are not to be found by trying);
 - an address is given at most 30 relay logins a day, and all addresses together 2,000 a day (the variable
   `TURN_DAILY_MAX` sets another number). Past that, rooms still work, without a relay. This is the ceiling on what
   the relay can be made to cost: a login lets its holder send through the relay for three hours.

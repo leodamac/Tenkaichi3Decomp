@@ -23,6 +23,7 @@
 
 const ROOM_SECONDS = 600;       // a room nobody joined disappears after ten minutes
 const ROOMS_PER_ADDRESS = 4;    // rooms one address may have open at a time
+const WRONG_CODES_PER_HOUR = 30; // codes that name no room, from one address in an hour
 const HOSTS_PER_HOUR = 20;      // rooms one address may make in an hour
 const RELAY_PER_DAY_ADDRESS = 30; // relay logins one address may be given in a day
 const RELAY_PER_DAY = 2000;     // relay logins given in a day, all told (the variable TURN_DAILY_MAX overrides it): the
@@ -60,6 +61,65 @@ function cleanAddrs(addrs) {
         }
     }
     return out.length > 0 ? out : null;
+}
+
+// An address of a private network ("192.168.1.20:7000"): of use only to someone on that network.
+function isPrivate(a) {
+    const m = /^(\d+)\.(\d+)\./.exec(a);
+    if (!m) {
+        return false;
+    }
+    const x = Number(m[1]), y = Number(m[2]);
+    return x === 10 || x === 127 || (x === 172 && y >= 16 && y <= 31) || (x === 192 && y === 168) || (x === 169 && y === 254);
+}
+
+// What tells two machines of one household apart from strangers: the IPv4 address as it is, of an IPv6 address
+// the first four groups (the network's part).
+function network(ip) {
+    if (!ip.includes(":")) {
+        return ip;
+    }
+    const [head, tail] = ip.split("::");
+    const h = head ? head.split(":") : [], t = tail ? tail.split(":") : [];
+    const all = tail === undefined ? h : [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill("0"), ...t];
+    return all.slice(0, 4).map((g) => parseInt(g, 16) || 0).join(":");
+}
+
+// The public IPv4 addresses among what a game said about itself.
+function publicIps(addrs) {
+    const out = [];
+    for (const a of addrs) {
+        const m = /^(\d+\.\d+\.\d+\.\d+):/.exec(a);
+        if (m && !isPrivate(a)) {
+            out.push(m[1]);
+        }
+    }
+    return out;
+}
+
+// Whether the two are on one network: seen by this Worker under the same address (or IPv6 network), or, when one
+// came by IPv4 and the other by IPv6, with the same public IPv4 address in what they found out themselves.
+function sameNetwork(ipA, addrsA, ipB, addrsB) {
+    if (ipA !== "" && network(ipA) === network(ipB)) {
+        return true;
+    }
+    const b = publicIps(addrsB);
+    return publicIps(addrsA).some((x) => b.includes(x));
+}
+
+// A player's addresses as the other player gets them: those of a private network only for someone on it.
+function shown(addrs, same) {
+    return addrs.filter((a) => a !== "same=1" && (same || !isPrivate(a)));
+}
+
+// How many uses of `what` the slot has so far (0 if none or not known).
+async function usesSoFar(env, what, slot) {
+    try {
+        const row = await env.DB.prepare("SELECT n FROM used WHERE what = ? AND slot = ?").bind(what, slot).first();
+        return row ? row.n : 0;
+    } catch (e) {
+        return 0;
+    }
 }
 
 // Counts one more use of `what` in the time slot that starts at `slot` (seconds) and says how many that makes; 0 if
@@ -176,8 +236,15 @@ export default {
         if (code.length !== 6) {
             return reply({ error: "no room" }, 404);
         }
+        const hour = now - (now % 3600);
+        if (what === "join" && (await usesSoFar(env, "miss:" + ip, hour)) >= WRONG_CODES_PER_HOUR) {
+            return reply({ error: "busy" }, 429); // (codes are not to be found by trying)
+        }
         const room = await env.DB.prepare("SELECT * FROM rooms WHERE code = ? AND made >= ?").bind(code, now - ROOM_SECONDS).first();
         if (!room) {
+            if (what === "join") {
+                await countUse(env, "miss:" + ip, hour);
+            }
             return reply({ error: "no room" }, 404);
         }
 
@@ -190,16 +257,23 @@ export default {
                 return reply({ error: "version" }, 409);
             }
             const key = randomText(24, ALPHABET);
-            // only if nobody has joined yet (the update tells whether it was this request that got the place)
+            const hostAddrs = JSON.parse(room.host_addrs);
+            const same = sameNetwork(ip, addrs, room.ip, hostAddrs);
+            // what the host will be told of this player (kept as it will be shown; "same=1" remembers the finding)
+            const kept = shown(addrs, same);
             if (/^[0-9.]{7,15}$/.test(ip)) {
-                addrs.push("seen=" + ip); // for the host's relay: whom to let through
+                kept.push("seen=" + ip); // for the host's relay: whom to let through
             }
+            if (same) {
+                kept.push("same=1");
+            }
+            // only if nobody has joined yet (the update tells whether it was this request that got the place)
             const done = await env.DB.prepare("UPDATE rooms SET join_key = ?, join_name = ?, join_addrs = ? WHERE code = ? AND join_key IS NULL")
-                .bind(key, cleanName(body.name), JSON.stringify(addrs), code).run();
+                .bind(key, cleanName(body.name), JSON.stringify(kept), code).run();
             if (!done.meta || done.meta.changes !== 1) {
                 return reply({ error: "full" }, 409);
             }
-            return reply({ key, you: ip, peer: { name: room.host_name, addrs: JSON.parse(room.host_addrs) } });
+            return reply({ key, you: ip, peer: { name: room.host_name, addrs: shown(hostAddrs, same) } });
         }
 
         const isHost = body.key === room.host_key, isJoin = room.join_key !== null && body.key === room.join_key;
@@ -208,9 +282,9 @@ export default {
         }
         if (what === "poll") {
             if (isHost) {
-                return reply({ peer: room.join_key !== null ? { name: room.join_name, addrs: JSON.parse(room.join_addrs) } : null });
+                return reply({ peer: room.join_key !== null ? { name: room.join_name, addrs: shown(JSON.parse(room.join_addrs), true) } : null });
             }
-            return reply({ peer: { name: room.host_name, addrs: JSON.parse(room.host_addrs) } });
+            return reply({ peer: { name: room.host_name, addrs: shown(JSON.parse(room.host_addrs), JSON.parse(room.join_addrs).includes("same=1")) } });
         }
         if (what === "addrs") { // the host has found out more about how it can be reached
             const addrs = cleanAddrs(body.addrs);

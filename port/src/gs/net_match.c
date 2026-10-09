@@ -460,7 +460,8 @@ static int SDLCALL match_thread(void *arg) {
         if (!json_peer(answer, &st)) {
             set_state(-1, SDL_strstr(answer, "version") != NULL ? "The host's game is a different version: both players need the same release." :
                           SDL_strstr(answer, "full") != NULL ? "Someone has already joined that room." :
-                          SDL_strstr(answer, "no room") != NULL ? "No room with that code (codes last ten minutes)." : "The matchmaking service gave no answer.");
+                          SDL_strstr(answer, "no room") != NULL ? "No room with that code (codes last ten minutes)." :
+                          SDL_strstr(answer, "busy") != NULL ? "Too many wrong codes from this address; try again in an hour." : "The matchmaking service gave no answer.");
             return 0;
         }
         if (STOPPED()) {
